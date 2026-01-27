@@ -1,1 +1,21 @@
+[package]
+name = "HackerOS-Containers"
+version = "0.1.0"
+edition = "2021"
+authors = ["HackerOS Team <hackeros068@gmail.com>"]
+license = "MIT"
+description = "HackerOS Containers: Advanced container management tool for HackerOS with isolation, resource management, and real-time monitoring."
+repository = "https://github.com/hackeros/hackeros-containers"
 
+[dependencies]
+lexopt = "0.3.0"  # For CLI argument parsing
+owo-colors = "3.5.0"  # For colorful output
+miette = { version = "5.5.0", features = ["fancy"] }  # For pretty error handling
+serde = { version = "1.0", features = ["derive"] }  # For serialization/deserialization
+toml = "0.8.0"  # For parsing .hk files (which are TOML-like)
+nix = "0.28.0"  # For low-level system calls (namespaces, cgroups, etc.)
+oci-spec = "0.5.0"  # For OCI spec compliance
+anyhow = "1.0"  # For error handling
+log = "0.4"  # For logging
+env_logger = "0.10"  # For env-based logging
+colored = "2.0"  # Additional coloring if needed
