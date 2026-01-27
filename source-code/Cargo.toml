@@ -5,7 +5,7 @@ edition = "2021"
 authors = ["HackerOS Team <hackeros068@gmail.com>"]
 license = "MIT"
 description = "HackerOS Containers: Advanced container management tool for HackerOS with isolation, resource management, and real-time monitoring."
-repository = "https://github.com/hackeros/hackeros-containers"
+repository = "https://github.com/HackerOS-Linux-System/HackerOS-Containers"
 
 [dependencies]
 lexopt = "0.3.0"  # For CLI argument parsing
