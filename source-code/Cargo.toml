@@ -1,26 +1,44 @@
 [package]
-name = "HackerOS-Containers"
-version = "0.3.0"
+name = "hco"
+version = "0.2.0"
 edition = "2021"
 authors = ["HackerOS Team <hackeros068@gmail.com>"]
 license = "MIT"
-description = "HackerOS Containers: Advanced container management tool for HackerOS with isolation, resource management, and real-time monitoring."
-repository = "https://github.com/HackerOS-Linux-System/HackerOS-Containers"
+description = "HackerOS Containers: Advanced runtime with OCI pull, PTY, and Port Forwarding."
+
+[[bin]]
+name = "hco"
+path = "src/main.rs"
 
 [dependencies]
+# CLI & UI
 lexopt = "0.3.0"
 owo-colors = "3.5.0"
 miette = { version = "5.5.0", features = ["fancy"] }
 thiserror = "1.0"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0" # For state management
-nix = { version = "0.28.0", features = ["process", "sched", "fs", "signal", "mount", "user", "net", "ioctl", "hostname"] }
-oci-spec = "0.5.0"
 log = "0.4"
 env_logger = "0.10"
-uuid = { version = "1.0", features = ["v4"] } # For unique container IDs
-nom = "7.1" # For parsing .hk files
-flate2 = "1.0" # For unpacking images
-tar = "0.4" # For unpacking images
-ureq = "2.9" # Lightweight HTTP client for downloading images (blocking)
+termion = "2.0" # For Raw Terminal mode
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# System & Low Level
+nix = { version = "0.27.1", features = ["process", "sched", "fs", "signal", "mount", "user", "net", "ioctl", "hostname", "resource", "mman", "term", "poll"] }
+libc = "0.2"
+caps = "0.5"
+
+# Parsing & Utils
+nom = "7.1"
+uuid = { version = "1.0", features = ["v4"] }
 once_cell = "1.18"
+
+# Image & Filesystem Handling
+ureq = { version = "2.9", features = ["json"] } # HTTP Client
+flate2 = "1.0"
+tar = "0.4"
+sha2 = "0.10"
+hex = "0.4"
+walkdir = "2.4"
+base64 = "0.21"
