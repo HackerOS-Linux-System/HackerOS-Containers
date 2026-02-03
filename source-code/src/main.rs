@@ -188,7 +188,7 @@ fn show_stats_loop(state: &ContainerState) -> Result<()> {
 }
 
 fn print_help() {
-    println!("hco v0.6.0");
+    println!("hco v0.2");
     println!("  run <name> -i <image> -p 80:80 -v /mnt:/mnt");
     println!("  enter <name>");
     println!("  stats <name>");
