@@ -1,25 +1,24 @@
-use std::fs;
-use std::path::PathBuf;
-use std::io::{Read, Write, stdout};
-use std::thread;
-use std::time::Duration;
-
 use lexopt::{Arg, Parser, ValueExt};
-use miette::{miette, IntoDiagnostic, Result, Context};
+use miette::{miette, IntoDiagnostic, Result};
 use owo_colors::OwoColorize;
-use nix::pty::openpty;
-use nix::unistd::{fork, ForkResult, setsid, dup2};
-use nix::fcntl::OFlag;
-use termion::raw::IntoRawMode;
+use tokio::runtime::Runtime;
 
 mod config;
 mod container;
 mod image;
 mod network;
 mod sandbox;
+mod pod;
+mod api;
+mod metrics;
+mod cni;
+mod seccomp;
+mod logging;
+mod utils;
 
-use config::{HkConfig, Specs};
-use container::{start_container, stop_container, find_container, ContainerState, CGROUP_ROOT};
+use config::HkConfig;
+use container::{start_container, stop_container, find_container};
+use pod::{start_pod, stop_pod, PodSpec};
 
 enum CommandType {
     Run { detached: bool, name: String, image: String, mounts: Vec<String>, ports: Vec<String> },
@@ -27,7 +26,16 @@ enum CommandType {
     Stats { target: String },
     List,
     Stop { target: String },
+    Pod { subcommand: PodCommand },
+    Api { addr: String },
     Help,
+}
+
+enum PodCommand {
+    Create { name: String, spec_file: std::path::PathBuf },
+    Start { name: String },
+    Stop { name: String },
+    List,
 }
 
 fn parse_args() -> Result<CommandType> {
@@ -38,6 +46,9 @@ fn parse_args() -> Result<CommandType> {
     let mut image_val = None;
     let mut mounts = Vec::new();
     let mut ports = Vec::new();
+    let mut api_addr = String::from("127.0.0.1:8080");
+    let mut pod_cmd = None;
+    let mut pod_spec = None;
 
     while let Some(arg) = parser.next().into_diagnostic()? {
         match arg {
@@ -46,152 +57,94 @@ fn parse_args() -> Result<CommandType> {
             Arg::Short('v') | Arg::Long("volume") => mounts.push(parser.value().into_diagnostic()?.string().into_diagnostic()?),
             Arg::Short('p') | Arg::Long("publish") => ports.push(parser.value().into_diagnostic()?.string().into_diagnostic()?),
             Arg::Short('i') | Arg::Long("image") => image_val = Some(parser.value().into_diagnostic()?.string().into_diagnostic()?),
+            Arg::Long("api-addr") => api_addr = parser.value().into_diagnostic()?.string().into_diagnostic()?,
+            Arg::Short('f') | Arg::Long("file") => pod_spec = Some(std::path::PathBuf::from(parser.value().into_diagnostic()?.string().into_diagnostic()?)),
             Arg::Value(val) => target_val = Some(val.string().into_diagnostic()?),
-            _ => {},
+            _ => {}
         }
     }
 
     match command.as_deref() {
-        Some("run") => {
-            Ok(CommandType::Run { 
-                detached, 
-                name: target_val.unwrap_or_else(|| "hacker_container".into()), 
-                image: image_val.unwrap_or("alpine:latest".into()),
-                mounts,
-                ports
-            })
-        },
+        Some("run") => Ok(CommandType::Run {
+            detached,
+            name: target_val.unwrap_or_else(|| "hacker_container".into()),
+                          image: image_val.unwrap_or("alpine:latest".into()),
+                          mounts,
+                          ports,
+        }),
         Some("enter") => Ok(CommandType::Enter { target: target_val.ok_or(miette!("ID needed"))? }),
         Some("stats") => Ok(CommandType::Stats { target: target_val.ok_or(miette!("ID needed"))? }),
         Some("stop") => Ok(CommandType::Stop { target: target_val.ok_or(miette!("ID needed"))? }),
         Some("list") => Ok(CommandType::List),
+        Some("pod") => {
+            let sub = match target_val.as_deref() {
+                Some("create") => PodCommand::Create { name: target_val.ok_or(miette!("Pod name needed"))?, spec_file: pod_spec.ok_or(miette!("Pod spec file needed"))? },
+                Some("start") => PodCommand::Start { name: target_val.ok_or(miette!("Pod name needed"))? },
+                Some("stop") => PodCommand::Stop { name: target_val.ok_or(miette!("Pod name needed"))? },
+                Some("list") => PodCommand::List,
+                _ => return Err(miette!("Pod subcommand: create, start, stop, list")),
+            };
+            Ok(CommandType::Pod { subcommand: sub })
+        }
+        Some("api") => Ok(CommandType::Api { addr: api_addr }),
         _ => Ok(CommandType::Help),
     }
 }
 
 fn main() -> Result<()> {
+    env_logger::init();
+
     if !nix::unistd::Uid::effective().is_root() {
-        return Err(miette!("Root privileges required."));
+        eprintln!("{} Warning: Not running as root. Some features may not work.", "[WARN]".yellow());
     }
+
+    container::ensure_directories()?;
 
     match parse_args()? {
         CommandType::Run { detached, name, image, mounts, ports } => {
             let config = HkConfig::create_ephemeral(&name, &image, mounts, ports);
             start_container(config, detached)?;
-        },
+        }
         CommandType::Enter { target } => {
-            // PTY Based Enter
             let (_, state) = find_container(&target)?;
-            enter_with_pty(&state)?;
-        },
+            container::enter_container_pty(&state)?;
+        }
         CommandType::Stats { target } => {
             let (_, state) = find_container(&target)?;
-            show_stats_loop(&state)?;
-        },
-        CommandType::List => {
-            let _ = fs::create_dir_all(container::HACKEROS_RUN);
-            println!("{0: <10} {1: <15} {2: <20} {3: <10}", "ID", "NAME", "IMAGE", "STATUS");
-            for entry in fs::read_dir(container::HACKEROS_RUN).into_diagnostic()? {
-                let path = entry.into_diagnostic()?.path();
-                if path.extension().map_or(false, |e| e == "json") {
-                    let s: ContainerState = serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
-                    println!("{0: <10} {1: <15} {2: <20} {3: <10}", &s.id[0..8], s.name.cyan(), s.image, s.status.green());
-                }
-            }
-        },
+            container::show_stats_loop(&state)?;
+        }
         CommandType::Stop { target } => stop_container(&target)?,
+        CommandType::List => container::list_containers()?,
+        CommandType::Pod { subcommand } => match subcommand {
+            PodCommand::Create { name, spec_file } => {
+                let spec = PodSpec::from_file(spec_file)?;
+                start_pod(&name, spec)?;
+            }
+            PodCommand::Start { name } => start_pod(&name, PodSpec::default())?,
+            PodCommand::Stop { name } => stop_pod(&name)?,
+            PodCommand::List => pod::list_pods()?,
+        },
+        CommandType::Api { addr } => {
+            println!("Starting REST API on {}", addr);
+            let rt = Runtime::new().into_diagnostic()?;
+            rt.block_on(api::run_server(addr))?;
+        }
         CommandType::Help => print_help(),
     }
     Ok(())
 }
 
-fn enter_with_pty(state: &ContainerState) -> Result<()> {
-    println!("{} Entering {} (PTY)...", "[ENTER]".bold().green(), state.name);
-    
-    let result = openpty(None, None).into_diagnostic()?;
-    let master = result.master;
-    let slave = result.slave;
-
-    match unsafe { fork() } {
-        Ok(ForkResult::Parent { .. }) => {
-            // Parent: Pump data between stdin/stdout and master PTY
-            let mut raw_stdout = stdout().into_raw_mode().into_diagnostic()?;
-            let mut master_file = unsafe { fs::File::from_raw_fd(master) };
-            let mut master_reader = master_file.try_clone().unwrap();
-            
-            // Thread for reading master PTY -> stdout
-            thread::spawn(move || {
-                let mut buf = [0; 1024];
-                while let Ok(n) = master_reader.read(&mut buf) {
-                    if n == 0 { break; }
-                    let _ = raw_stdout.write_all(&buf[..n]);
-                    let _ = raw_stdout.flush();
-                }
-            });
-
-            // Main thread: stdin -> master PTY
-            let mut stdin = std::io::stdin();
-            let mut buf = [0; 1024];
-            while let Ok(n) = stdin.read(&mut buf) {
-                if n == 0 { break; }
-                if master_file.write_all(&buf[..n]).is_err() { break; }
-            }
-        }
-        Ok(ForkResult::Child) => {
-            // Child: Join namespaces, attach PTY
-            attach_namespaces(state.pid)?;
-            
-            setsid().into_diagnostic()?;
-            unsafe {
-                for i in 0..3 { dup2(slave, i); }
-            }
-            // Execute Shell
-            let cmd = std::ffi::CString::new("/bin/sh").unwrap();
-            let _ = nix::unistd::execvp(&cmd, &[cmd.clone()]);
-        }
-        Err(_) => return Err(miette!("Fork failed")),
-    }
-    Ok(())
-}
-
-fn attach_namespaces(pid: i32) -> Result<()> {
-    let pid_fd = nix::unistd::Pid::from_raw(pid);
-    for ns in &["ipc", "uts", "net", "pid", "mnt"] {
-        let p = format!("/proc/{}/ns/{}", pid_fd, ns);
-        let f = fs::File::open(p).into_diagnostic().context("ns open")?;
-        nix::sched::setns(f, nix::sched::CloneFlags::empty()).into_diagnostic()?;
-    }
-    Ok(())
-}
-
-fn show_stats_loop(state: &ContainerState) -> Result<()> {
-    let cg_path = PathBuf::from(format!("{}/{}", CGROUP_ROOT, state.id));
-    println!("Monitoring {} (Ctrl+C to stop)...", state.name.cyan());
-    
-    loop {
-        print!("\x1B[2J\x1B[1;1H"); // Clear screen
-        println!("{} Stats", state.name.bold());
-        println!("-------------------------");
-        
-        if let Ok(c) = fs::read_to_string(cg_path.join("memory.current")) {
-             let bytes: u64 = c.trim().parse().unwrap_or(0);
-             println!("Memory: {:.2} MB", bytes as f64 / 1024.0 / 1024.0);
-        }
-        
-        if let Ok(c) = fs::read_to_string(cg_path.join("cpu.stat")) {
-             // simplified parsing
-             println!("CPU Stat:\n{}", c);
-        }
-
-        thread::sleep(Duration::from_secs(1));
-    }
-}
-
 fn print_help() {
-    println!("hco v0.2");
-    println!("  run <name> -i <image> -p 80:80 -v /mnt:/mnt");
+    println!("hco v0.3 – HackerOS Containers");
+    println!("Usage:");
+    println!("  run <name> -i  Pagklasipikar [-p host:container] [-v host:path] [-d]");
     println!("  enter <name>");
     println!("  stats <name>");
     println!("  stop <name>");
     println!("  list");
+    println!("  pod create <name> -f <pod.yaml>");
+    println!("  pod start <name>");
+    println!("  pod stop <name>");
+    println!("  pod list");
+    println!("  api --api-addr 0.0.0.0:8080");
 }
