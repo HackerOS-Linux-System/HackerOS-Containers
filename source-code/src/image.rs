@@ -1,19 +1,17 @@
 use std::fs::{self, File};
-use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use miette::{miette, IntoDiagnostic, Result, Context};
 use owo_colors::OwoColorize;
 use sha2::{Digest, Sha256};
 use flate2::read::GzDecoder;
 use serde_json::Value;
-use ureq::{Agent, AgentBuilder};
+use ureq::AgentBuilder;
 
 use crate::container::HACKEROS_LIB;
 
 pub struct ImageManager;
 
 impl ImageManager {
-    /// Pobiera warstwy obrazu. Jeśli nie ma go lokalnie, ściąga z rejestru.
     pub fn resolve_image_layers(image_ref: &str) -> Result<Vec<PathBuf>> {
         let (registry, repo, tag) = parse_image_ref(image_ref);
         let safe_name = format!("{}_{}_{}", registry.replace("/", "_"), repo.replace("/", "_"), tag);
@@ -27,7 +25,6 @@ impl ImageManager {
         Self::pull_image(&registry, &repo, &tag, &image_dir)
     }
 
-    /// Pobiera obraz z rejestru i zapisuje warstwy.
     fn pull_image(registry: &str, repo: &str, tag: &str, dest_dir: &Path) -> Result<Vec<PathBuf>> {
         fs::create_dir_all(dest_dir).into_diagnostic()?;
 
@@ -44,7 +41,6 @@ impl ImageManager {
 
         let manifest_json: Value = resp.into_json().into_diagnostic()?;
 
-        // Obsługa manifest list (multi‑arch) oraz pojedynczego manifestu
         let (layers, config_digest) = if let Some(manifests) = manifest_json["manifests"].as_array() {
             let arch = std::env::consts::ARCH;
             let os = std::env::consts::OS;
@@ -88,12 +84,10 @@ impl ImageManager {
             (layers, config_digest)
         };
 
-        // Pobierz plik konfiguracyjny (opcjonalny)
         if !config_digest.is_empty() {
             download_config(registry, repo, &token, &config_digest, dest_dir)?;
         }
 
-        // Pobierz i rozpakuj warstwy
         let layers_dir = PathBuf::from(format!("{}/layers", HACKEROS_LIB));
         fs::create_dir_all(&layers_dir).into_diagnostic()?;
 
@@ -107,7 +101,6 @@ impl ImageManager {
             layer_paths.push(layer_path);
         }
 
-        // Zapisz manifest (listę ścieżek warstw) w katalogu obrazu
         let manifest_path = dest_dir.join("layers.json");
         let paths_str: Vec<String> = layer_paths
         .iter()
@@ -117,7 +110,6 @@ impl ImageManager {
         .into_diagnostic()
         .wrap_err("Failed to write layers.json")?;
 
-        // Skopiuj plik konfiguracyjny (jeśli istnieje) do katalogu obrazu
         if !config_digest.is_empty() {
             let config_path = dest_dir.join("config.json");
             let config_file = dest_dir.join(format!("{}.json", config_digest.replace("sha256:", "")));
@@ -129,7 +121,6 @@ impl ImageManager {
         Ok(layer_paths)
     }
 
-    /// Importuje obraz z archiwum tar (legacy).
     pub fn import_tar(path: &Path, name: &str) -> Result<()> {
         println!("{} Importing legacy tarball {}...", "[IMPORT]".bold().yellow(), name);
         let safe_name = name.replace(":", "_");
@@ -148,10 +139,6 @@ impl ImageManager {
         Ok(())
     }
 }
-
-// ------------------------------------------------------------
-// Funkcje pomocnicze
-// ------------------------------------------------------------
 
 fn parse_image_ref(r: &str) -> (String, String, String) {
     let parts: Vec<&str> = r.split('/').collect();
@@ -234,7 +221,6 @@ fn download_and_extract_layer(
         std::io::copy(&mut reader, &mut f).into_diagnostic()?;
     }
 
-    // Weryfikacja sumy kontrolnej
     let mut hasher = Sha256::new();
     let mut file = File::open(&tmp_tar).into_diagnostic()?;
     std::io::copy(&mut file, &mut hasher).into_diagnostic()?;
