@@ -47,7 +47,6 @@ fn parse_args() -> Result<CommandType> {
     let mut mounts = Vec::new();
     let mut ports = Vec::new();
     let mut api_addr = String::from("127.0.0.1:8080");
-    let mut pod_cmd = None;
     let mut pod_spec = None;
 
     while let Some(arg) = parser.next().into_diagnostic()? {
@@ -137,7 +136,7 @@ fn main() -> Result<()> {
 fn print_help() {
     println!("hco v0.3 – HackerOS Containers");
     println!("Usage:");
-    println!("  run <name> -i  Pagklasipikar [-p host:container] [-v host:path] [-d]");
+    println!("  run <name> -i 镜像 [-p host:container] [-v host:path] [-d]");
     println!("  enter <name>");
     println!("  stats <name>");
     println!("  stop <name>");
