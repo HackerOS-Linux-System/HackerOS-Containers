@@ -3,7 +3,7 @@ use std::fs;
 use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use miette::{miette, IntoDiagnostic, Result};
-use crate::container::{self, ContainerState, HACKEROS_RUN};
+use crate::container::{HACKEROS_RUN};
 use crate::config::HkConfig;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -74,13 +74,14 @@ pub fn start_pod(name: &str, spec: PodSpec) -> Result<()> {
     }
 
     for mut container_cfg in spec.containers {
-        container_cfg.metadata.name = format!("{}-{}", name, container_cfg.metadata.name);
+        let container_name = format!("{}-{}", name, container_cfg.metadata.name);
+        container_cfg.metadata.name = container_name.clone();
         if spec.shared_network {
             container_cfg.runtime.network_mode = "none".to_string();
         }
         crate::container::start_container(container_cfg, true)?;
-        let (_, state) = crate::container::find_container(&container_cfg.metadata.name)?;
-        container_ids.push(state.id.clone());
+        let (_, state) = crate::container::find_container(&container_name)?;
+        container_ids.push(state.id);
     }
 
     let pod_state = PodState {
