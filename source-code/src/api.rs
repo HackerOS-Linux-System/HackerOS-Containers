@@ -10,7 +10,7 @@ use serde_json::json;
 use std::sync::Arc;
 use miette::Result;
 
-use crate::container::{self, ContainerState, HACKEROS_RUN, HACKEROS_LOG};
+use crate::container::{ContainerState, HACKEROS_RUN, HACKEROS_LOG};
 use crate::config::HkConfig;
 use crate::pod::{PodSpec, PodState};
 use crate::metrics::gather_metrics;
@@ -217,8 +217,8 @@ async fn list_pods(State(_state): State<Arc<AppState>>) -> Response {
     let pods = tokio::task::spawn_blocking(|| {
         let mut pods = Vec::new();
         let pods_dir = std::path::PathBuf::from(crate::container::HACKEROS_RUN).join("pods");
-        if pods_dir.exists() {
-            for entry in std::fs::read_dir(pods_dir).unwrap_or_default().flatten() {
+        if let Ok(entries) = std::fs::read_dir(pods_dir) {
+            for entry in entries.flatten() {
                 let path = entry.path();
                 if path.extension().map_or(false, |e| e == "json") {
                     if let Ok(content) = std::fs::read_to_string(&path) {
