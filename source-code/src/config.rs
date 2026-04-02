@@ -74,7 +74,7 @@ impl HkConfig {
         HkConfig {
             metadata: Metadata {
                 name: name.to_string(),
-                version: "0.0.1".to_string(),
+                version: "0.3.0".to_string(),
                 authors: "User".to_string(),
                 license: "None".to_string(),
             },
@@ -127,10 +127,12 @@ fn parse_hk_file(input: &str) -> Result<HkConfig> {
     }
 
     let metadata = sections.get("Metadata").ok_or_else(|| miette!("Missing [Metadata] section"))?;
-    let specs_map = sections.get("Specs").unwrap_or(&HashMap::new());
-    let runtime_map = sections.get("Runtime").unwrap_or(&HashMap::new());
-    let security_map = sections.get("Security").unwrap_or(&HashMap::new());
-    let network_map = sections.get("Network").unwrap_or(&HashMap::new());
+
+    let empty_map = HashMap::new();
+    let specs_map = sections.get("Specs").unwrap_or(&empty_map);
+    let runtime_map = sections.get("Runtime").unwrap_or(&empty_map);
+    let security_map = sections.get("Security").unwrap_or(&empty_map);
+    let network_map = sections.get("Network").unwrap_or(&empty_map);
 
     let mounts = specs_map
     .get("mounts")
@@ -206,7 +208,7 @@ fn parse_hk_file(input: &str) -> Result<HkConfig> {
     Ok(HkConfig {
         metadata: Metadata {
             name: metadata.get("name").cloned().unwrap_or_else(|| "unknown".to_string()),
-       version: metadata.get("version").cloned().unwrap_or_else(|| "0.1".to_string()),
+       version: metadata.get("version").cloned().unwrap_or_else(|| "0.3.0".to_string()),
        authors: metadata.get("authors").cloned().unwrap_or_default(),
        license: metadata.get("license").cloned().unwrap_or_default(),
         },
