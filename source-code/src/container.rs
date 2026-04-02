@@ -1,6 +1,6 @@
 use std::fs::{self, File};
 use std::io::Read;
-use std::os::unix::io::AsRawFd;
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
@@ -11,7 +11,7 @@ use nix::sys::wait::waitpid;
 use nix::unistd::Pid;
 use owo_colors::OwoColorize;
 use serde::{Deserialize, Serialize};
-use miette::{IntoDiagnostic, WrapErr, Result, Context};
+use miette::{IntoDiagnostic, WrapErr, Result};
 
 use crate::config::HkConfig;
 use crate::image::ImageManager;
@@ -19,7 +19,6 @@ use crate::sandbox::{setup_overlayfs, setup_cgroups, setup_namespaces, seccomp_s
 use crate::network::{setup_bridge, create_veth_pair, setup_port_forwarding, cleanup_port_forwarding, setup_cni};
 use crate::logging::ContainerLogger;
 use crate::metrics::record_container_metrics;
-use crate::utils::parse_bytes;
 
 pub const HACKEROS_LIB: &str = "/var/lib/hackeros";
 pub const HACKEROS_RUN: &str = "/var/run/hackeros";
@@ -98,10 +97,8 @@ pub fn start_container(config: HkConfig, detached: bool) -> Result<()> {
     }
 
     let stack = &mut [0; 2 * 1024 * 1024];
-    // Use a raw pointer to pass config (avoid closure move issues)
     let cfg_ptr = Box::into_raw(Box::new(child_cfg));
     let cb = Box::new(move || {
-        // Reconstruct ChildConfig from raw pointer
         let cfg = unsafe { Box::from_raw(cfg_ptr) };
         if let Err(e) = setup_namespaces(cfg.rootless) {
             eprintln!("Namespace setup failed: {}", e);
@@ -248,7 +245,7 @@ pub fn enter_container_pty(state: &ContainerState) -> Result<()> {
     match unsafe { fork() } {
         Ok(ForkResult::Parent { child: _ }) => {
             let mut raw_stdout = std::io::stdout().into_raw_mode().into_diagnostic()?;
-            let mut master_file = unsafe { fs::File::from_raw_fd(master.as_raw_fd()) };
+            let mut master_file = unsafe { File::from_raw_fd(master.as_raw_fd()) };
             let mut master_reader = master_file.try_clone().unwrap();
 
             thread::spawn(move || {
@@ -270,14 +267,13 @@ pub fn enter_container_pty(state: &ContainerState) -> Result<()> {
         Ok(ForkResult::Child) => {
             attach_namespaces(state.pid)?;
             setsid().into_diagnostic()?;
-            unsafe {
-                for i in 0..3 {
-                    dup2(slave.as_raw_fd(), i).into_diagnostic()?;
-                }
+            // dup2 is safe – no need for unsafe block
+            for i in 0..3 {
+                dup2(slave.as_raw_fd(), i).into_diagnostic()?;
             }
             let cmd = std::ffi::CString::new("/bin/sh").unwrap();
             let args = [cmd.clone()];
-            let env = [std::ffi::CString::new("PATH=/bin:/usr/bin:/sbin").unwrap()];
+            let _env = [std::ffi::CString::new("PATH=/bin:/usr/bin:/sbin").unwrap()];
             let _ = nix::unistd::execvp(&cmd, &args);
             std::process::exit(1);
         }
@@ -290,7 +286,7 @@ fn attach_namespaces(pid: i32) -> Result<()> {
     let pid_fd = nix::unistd::Pid::from_raw(pid);
     for ns in &["ipc", "uts", "net", "pid", "mnt"] {
         let p = format!("/proc/{}/ns/{}", pid_fd, ns);
-        let f = fs::File::open(p).into_diagnostic().context("ns open")?;
+        let f = fs::File::open(p).into_diagnostic()?;
         nix::sched::setns(f, nix::sched::CloneFlags::empty()).into_diagnostic()?;
     }
     Ok(())
