@@ -1,25 +1,30 @@
 use std::ffi::CString;
 use std::fs;
 use std::path::{Path, PathBuf};
+
+use miette::{IntoDiagnostic, WrapErr, Result};
 use nix::mount::{mount, umount2, MntFlags, MsFlags};
 use nix::sched::{unshare, CloneFlags};
-use nix::unistd::{chdir, pivot_root, sethostname, execve, setuid, setgid, Uid, Gid};
-use miette::{IntoDiagnostic, WrapErr, Result};
+use nix::unistd::{chdir, execve, pivot_root, sethostname, setgid, setuid, Gid, Uid};
 
-use crate::container::{HACKEROS_LIB, CGROUP_ROOT};
 use crate::config::Specs;
+use crate::container::{CGROUP_ROOT, HACKEROS_LIB};
 use crate::seccomp::apply_seccomp;
 
+// ── Child config ──────────────────────────────────────────────────────────────
+
 pub struct ChildConfig {
-    pub rootfs: PathBuf,
-    pub hostname: String,
-    pub ip_addr: String,
-    pub mounts: Vec<String>,
-    pub env: Vec<String>,
-    pub cmd: Vec<String>,
+    pub rootfs:          PathBuf,
+    pub hostname:        String,
+    pub ip_addr:         String,
+    pub mounts:          Vec<String>,
+    pub env:             Vec<String>,
+    pub cmd:             Vec<String>,
     pub seccomp_profile: Option<String>,
-    pub rootless: bool,
+    pub rootless:        bool,
 }
+
+// ── Namespace setup (called in child before exec) ─────────────────────────────
 
 pub fn setup_namespaces(rootless: bool) -> Result<()> {
     if rootless {
@@ -40,152 +45,169 @@ pub fn setup_namespaces(rootless: bool) -> Result<()> {
 }
 
 pub fn seccomp_setup(profile: &Option<String>) -> Result<()> {
-    if let Some(profile_path) = profile {
-        apply_seccomp(profile_path)?;
+    if let Some(path) = profile {
+        apply_seccomp(path)?;
     }
     Ok(())
 }
 
+// ── Child entrypoint (runs inside new namespaces) ─────────────────────────────
+
 pub fn child_entrypoint(config: ChildConfig) -> isize {
+    // Set up network interface inside the container's netns
     crate::network::setup_container_interface(&config.ip_addr, "10.10.0.1");
 
     if let Err(e) = sethostname(&config.hostname) {
-        eprintln!("Failed to set hostname: {}", e);
+        eprintln!("sethostname failed: {}", e);
         return 1;
     }
 
-    for mount_spec in &config.mounts {
-        let parts: Vec<&str> = mount_spec.split(':').collect();
-        if parts.len() >= 2 {
-            let host_path = Path::new(parts[0]);
-            let target_path = config.rootfs.join(parts[1].trim_start_matches('/'));
-            if let Err(e) = fs::create_dir_all(&target_path) {
-                eprintln!("Failed to create target dir for mount: {}", e);
-                continue;
-            }
-            if let Err(e) = mount(
-                Some(host_path),
-                                  &target_path,
-                                  None::<&str>,
-                                  MsFlags::MS_BIND | MsFlags::MS_REC,
-                                  None::<&str>,
-            ) {
-                eprintln!("Failed to bind mount {} -> {}: {}", host_path.display(), target_path.display(), e);
-            }
+    // Bind-mount host volumes into rootfs
+    for spec in &config.mounts {
+        let parts: Vec<&str> = spec.splitn(3, ':').collect();
+        if parts.len() < 2 { continue; }
+        let host   = Path::new(parts[0]);
+        let target = config.rootfs.join(parts[1].trim_start_matches('/'));
+        if let Err(e) = fs::create_dir_all(&target) {
+            eprintln!("mkdir {:?}: {}", target, e);
+            continue;
+        }
+        if let Err(e) = mount(
+            Some(host), &target, None::<&str>,
+                              MsFlags::MS_BIND | MsFlags::MS_REC, None::<&str>,
+        ) {
+            eprintln!("bind mount {} -> {:?}: {}", host.display(), target, e);
         }
     }
 
+    // pivot_root
     let old_root = config.rootfs.join(".old_root");
     if let Err(e) = fs::create_dir_all(&old_root) {
-        eprintln!("Failed to create old_root: {}", e);
+        eprintln!("mkdir old_root: {}", e);
         return 1;
     }
     if let Err(e) = mount(
-        Some(&config.rootfs),
-                          &config.rootfs,
-                          None::<&str>,
-                          MsFlags::MS_BIND | MsFlags::MS_REC,
-                          None::<&str>,
+        Some(&config.rootfs), &config.rootfs, None::<&str>,
+                          MsFlags::MS_BIND | MsFlags::MS_REC, None::<&str>,
     ) {
-        eprintln!("Failed to bind mount rootfs: {}", e);
+        eprintln!("bind rootfs: {}", e);
         return 1;
     }
     if let Err(e) = pivot_root(&config.rootfs, &old_root) {
-        eprintln!("Pivot root failed: {}", e);
+        eprintln!("pivot_root: {}", e);
         return 1;
     }
     if let Err(e) = chdir("/") {
-        eprintln!("Chdir failed: {}", e);
+        eprintln!("chdir: {}", e);
         return 1;
     }
 
+    // Mount essential pseudo-filesystems
     let _ = fs::create_dir_all("/proc");
-    let _ = mount(Some("proc"), "/proc", Some("proc"), MsFlags::empty(), None::<&str>);
+    let _ = mount(Some("proc"),    "/proc", Some("proc"),    MsFlags::empty(), None::<&str>);
     let _ = fs::create_dir_all("/sys");
-    let _ = mount(Some("sysfs"), "/sys", Some("sysfs"), MsFlags::empty(), None::<&str>);
+    let _ = mount(Some("sysfs"),   "/sys",  Some("sysfs"),   MsFlags::empty(), None::<&str>);
     let _ = fs::create_dir_all("/dev");
-    let _ = mount(Some("devtmpfs"), "/dev", Some("devtmpfs"), MsFlags::empty(), None::<&str>);
+    let _ = mount(Some("devtmpfs"),"/dev",  Some("devtmpfs"), MsFlags::empty(), None::<&str>);
+    let _ = fs::create_dir_all("/dev/pts");
+    let _ = mount(Some("devpts"), "/dev/pts", Some("devpts"), MsFlags::empty(), None::<&str>);
 
+    // Detach old root
     let _ = umount2(Path::new("/.old_root"), MntFlags::MNT_DETACH);
     let _ = fs::remove_dir("/.old_root");
 
-    for env_var in &config.env {
-        let parts: Vec<&str> = env_var.splitn(2, '=').collect();
-        if parts.len() == 2 {
-            std::env::set_var(parts[0], parts[1]);
+    // Set environment variables
+    for ev in &config.env {
+        let mut parts = ev.splitn(2, '=');
+        if let (Some(k), Some(v)) = (parts.next(), parts.next()) {
+            std::env::set_var(k, v);
         }
     }
 
-    let cmd_str = if config.cmd.is_empty() {
-        "/bin/sh"
-    } else {
-        &config.cmd[0]
-    };
+    // exec the command
+    let cmd_str = config.cmd.first().map(|s| s.as_str()).unwrap_or("/bin/sh");
     let cmd = match CString::new(cmd_str) {
         Ok(c) => c,
-        Err(e) => {
-            eprintln!("Invalid command: {}", e);
-            return 1;
-        }
+        Err(e) => { eprintln!("Invalid command: {}", e); return 1; }
     };
-    let args: Vec<CString> = config.cmd
-    .iter()
-    .map(|s| CString::new(s.as_str()).unwrap_or_else(|_| CString::new("").unwrap()))
-    .collect();
-    let env = [
-        CString::new("PATH=/bin:/usr/bin:/sbin").unwrap(),
+    let args: Vec<CString> = if config.cmd.is_empty() {
+        vec![cmd.clone()]
+    } else {
+        config.cmd.iter()
+        .map(|s| CString::new(s.as_str()).unwrap_or_else(|_| CString::new("").unwrap()))
+        .collect()
+    };
+    let env_c = [
+        CString::new("PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin").unwrap(),
         CString::new("TERM=xterm-256color").unwrap(),
     ];
 
-    let _ = execve(&cmd, &args, &env);
-    eprintln!("Failed to execute {}", cmd_str);
+    let _ = execve(&cmd, &args, &env_c);
+    eprintln!("execve '{}' failed", cmd_str);
     1
 }
 
+// ── Overlayfs ─────────────────────────────────────────────────────────────────
+
 pub fn setup_overlayfs(container_id: &str, layers: &[PathBuf]) -> Result<PathBuf> {
-    let base_dir = PathBuf::from(format!("{}/containers/{}", HACKEROS_LIB, container_id));
-    let upper_dir = base_dir.join("upper");
-    let work_dir = base_dir.join("work");
-    let merged_dir = base_dir.join("merged");
+    let base     = PathBuf::from(format!("{}/containers/{}", HACKEROS_LIB, container_id));
+    let upper    = base.join("upper");
+    let work     = base.join("work");
+    let merged   = base.join("merged");
 
-    fs::create_dir_all(&upper_dir).into_diagnostic()?;
-    fs::create_dir_all(&work_dir).into_diagnostic()?;
-    fs::create_dir_all(&merged_dir).into_diagnostic()?;
+    fs::create_dir_all(&upper).into_diagnostic()?;
+    fs::create_dir_all(&work).into_diagnostic()?;
+    fs::create_dir_all(&merged).into_diagnostic()?;
 
-    let lowerdir_str = layers.iter().rev()
+    let lowerdir = layers.iter().rev()
     .map(|p| p.to_string_lossy().into_owned())
-    .collect::<Vec<String>>()
+    .collect::<Vec<_>>()
     .join(":");
 
-    let mount_opts = format!("lowerdir={},upperdir={},workdir={}", lowerdir_str, upper_dir.display(), work_dir.display());
+    let opts = format!(
+        "lowerdir={},upperdir={},workdir={}",
+        lowerdir,
+        upper.display(),
+                       work.display()
+    );
 
-    mount(Some("overlay"), &merged_dir, Some("overlay"), MsFlags::empty(), Some(mount_opts.as_str()))
-    .into_diagnostic()?;
+    mount(
+        Some("overlay"), &merged, Some("overlay"),
+          MsFlags::empty(), Some(opts.as_str()),
+    )
+    .into_diagnostic()
+    .wrap_err("Failed to mount overlayfs")?;
 
-    Ok(merged_dir)
+    Ok(merged)
 }
 
-pub fn setup_cgroups(container_id: &str, specs: &Specs) -> Result<()> {
-    let cgroup_path = PathBuf::from(format!("{}/{}", CGROUP_ROOT, container_id));
-    if !cgroup_path.exists() {
-        fs::create_dir_all(&cgroup_path).into_diagnostic()?;
-    }
+// ── Cgroups v2 ────────────────────────────────────────────────────────────────
 
+pub fn setup_cgroups(container_id: &str, specs: &Specs) -> Result<()> {
+    let cg = PathBuf::from(format!("{}/{}", CGROUP_ROOT, container_id));
+    fs::create_dir_all(&cg).into_diagnostic()?;
+
+    // Memory limit
     if let Some(mem) = &specs.memory_limit {
         let bytes = crate::utils::parse_bytes(mem);
-        fs::write(cgroup_path.join("memory.max"), bytes.to_string())
-        .ok();
+        if bytes > 0 {
+            fs::write(cg.join("memory.max"), bytes.to_string()).ok();
+            // Also set swap to 0
+            fs::write(cg.join("memory.swap.max"), "0").ok();
+        }
     }
 
-    if let Some(cpu) = specs.cpu_percent {
-        let quota = (cpu as u64) * 1000;
-        fs::write(cgroup_path.join("cpu.max"), format!("{} 100000", quota))
-        .ok();
+    // CPU quota: cpu_percent → microseconds per 100 ms period
+    if let Some(pct) = specs.cpu_percent {
+        let quota = (pct as u64) * 1_000; // e.g. 50% → 50000 µs
+        fs::write(cg.join("cpu.max"), format!("{} 100000", quota)).ok();
     }
 
+    // Add current process to cgroup
     let pid = nix::unistd::Pid::this();
-    fs::write(cgroup_path.join("cgroup.procs"), pid.as_raw().to_string())
-    .into_diagnostic()?;
+    fs::write(cg.join("cgroup.procs"), pid.as_raw().to_string())
+    .into_diagnostic()
+    .wrap_err("Failed to write cgroup.procs")?;
 
     Ok(())
 }
