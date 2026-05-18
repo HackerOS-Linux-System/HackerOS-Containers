@@ -1,0 +1,61 @@
+[Unit]
+Description=HackerOS Container Runtime API
+Documentation=https://github.com/hackeros/hco
+After=network-online.target
+Wants=network-online.target
+# Optional: use socket activation unit instead
+# Requires=hco-api.socket
+
+[Service]
+Type=notify
+NotifyAccess=main
+
+# Run as root (required for namespaces, cgroups, overlayfs)
+User=root
+Group=root
+
+ExecStartPre=/usr/local/bin/hco list
+ExecStart=/usr/local/bin/hco api \
+    --api-addr ${HCO_API_ADDR:-0.0.0.0:8080} \
+    ${HCO_API_TOKEN:+--api-token} ${HCO_API_TOKEN} \
+    ${HCO_TLS_CERT:+--tls-cert} ${HCO_TLS_CERT} \
+    ${HCO_TLS_KEY:+--tls-key}  ${HCO_TLS_KEY} \
+    ${HCO_OTLP:+--otlp} ${HCO_OTLP} \
+    --json-logs
+
+EnvironmentFile=-/etc/hco/hco.env
+
+# Restart policy
+Restart=on-failure
+RestartSec=5s
+StartLimitIntervalSec=60s
+StartLimitBurst=5
+
+# Runtime directories
+RuntimeDirectory=hackeros
+StateDirectory=hackeros
+LogsDirectory=hackeros
+ConfigurationDirectory=hco
+
+# Resource limits
+LimitNOFILE=65536
+LimitNPROC=32768
+TasksMax=8192
+
+# Security hardening
+# NOTE: namespaces require some of these to be relaxed
+NoNewPrivileges=no          # must allow for SUID / capabilities
+PrivateTmp=no               # containers share /tmp patterns
+PrivateDevices=no           # containers need /dev access
+ProtectHome=read-only
+ProtectSystem=no            # must write to /var/lib, /var/run, /sys/fs/cgroup
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_NET_ADMIN CAP_MKNOD CAP_SETUID CAP_SETGID CAP_CHOWN CAP_DAC_OVERRIDE CAP_SYS_CHROOT CAP_SYS_PTRACE
+AmbientCapabilities=CAP_SYS_ADMIN CAP_NET_ADMIN CAP_MKNOD CAP_SETUID CAP_SETGID CAP_CHOWN CAP_DAC_OVERRIDE CAP_SYS_CHROOT
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=hco-api
+
+[Install]
+WantedBy=multi-user.target
