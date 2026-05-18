@@ -1,0 +1,13 @@
+[Unit]
+Description=HackerOS Container Runtime API Socket
+PartOf=hco-api.service
+
+[Socket]
+ListenStream=8080
+# For TLS-only deployments, change to 443 and set HCO_TLS_CERT/HCO_TLS_KEY
+# ListenStream=443
+BindIPv6Only=both
+Service=hco-api.service
+
+[Install]
+WantedBy=sockets.target
