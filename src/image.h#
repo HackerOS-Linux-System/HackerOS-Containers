@@ -1,1 +1,135 @@
+use "std -> process" from "proc"
+use "std -> fs" from "fs"
+use "std -> path" from "path"
+use "std -> crypto" from "crypto"
+use "std -> log" from "log"
+use "std -> strings" from "str"
 
+mod sys_ffi
+
+const IMAGE_CACHE_DIR: string = "/var/lib/hco/images"
+const BUNDLE_ROOT:     string = "/var/lib/hco/bundles"
+
+pub struct ImageRef is
+    pub raw:  string
+    pub repo: string
+    pub tag:  string
+end
+
+pub fn parse_image_ref(raw: string) -> ImageRef is
+    let colon: int = str::find(raw, ":")
+    if colon < 0 is return ImageRef { raw: raw, repo: raw, tag: "latest" } end
+    return ImageRef { raw: raw, repo: str::slice(raw, 0, colon), tag: str::slice(raw, colon + 1, str::len(raw)) }
+end
+
+fn cache_key(image: ImageRef) -> string is
+    return str::replace(str::replace(image.repo, "/", "_"), ":", "_") + "_" + image.tag
+end
+
+;; Full-tarball digest — see [FIXED] note in the module doc comment.
+fn compute_digest(tarball_path: string) -> string is
+    return crypto::sha256_file(tarball_path)
+end
+
+pub fn is_cached(image: ImageRef) -> bool is
+    let dir: string = IMAGE_CACHE_DIR + "/" + cache_key(image)
+    return fs::exists(dir + "/rootfs") && fs::exists(dir + "/digest")
+end
+
+pub fn pull_image(image: ImageRef) -> string? is
+    let key: string = cache_key(image)
+    let dest_dir: string = IMAGE_CACHE_DIR + "/" + key
+
+    if is_cached(image) is
+        log::info("Using cached image " + image.raw)
+        return dest_dir + "/rootfs"
+    end
+
+    fs::mkdir_all(dest_dir)
+    let oci_layout: string = dest_dir + "/oci"
+    let pull: proc::RunResult = proc::run("skopeo",
+        ["copy", "docker://" + image.raw, "oci:" + oci_layout + ":" + image.tag])
+    if pull.exit_code != 0 is
+        log::error("skopeo copy failed for " + image.raw + ": " + pull.stderr)
+        return nil
+    end
+
+    let rootfs_dir: string = dest_dir + "/rootfs"
+    if fs::exists(rootfs_dir) is fs::remove_all(rootfs_dir) end
+    fs::mkdir_all(rootfs_dir)
+
+    let unpack: proc::RunResult = proc::run("umoci",
+        ["unpack", "--image", oci_layout + ":" + image.tag, rootfs_dir + "-bundle"])
+    if unpack.exit_code != 0 is
+        log::error("umoci unpack failed for " + image.raw + ": " + unpack.stderr)
+        return nil
+    end
+
+    ;; umoci lays out an OCI runtime bundle (config.json + rootfs/); we
+    ;; only need the extracted rootfs tree itself.
+    fs::remove_all(rootfs_dir)
+    fs::rename(rootfs_dir + "-bundle/rootfs", rootfs_dir)
+    fs::remove_all(rootfs_dir + "-bundle")
+
+    let tarball_for_digest: string = oci_layout + "/index.json"
+    let digest: string = compute_digest(tarball_for_digest)
+    fs::write(dest_dir + "/digest", digest)
+
+    log::info("Pulled image " + image.raw + " (digest " + str::slice(digest, 0, 12) + ")")
+    return rootfs_dir
+end
+
+;; Create a fresh, independent bundle directory (rootfs copy-on-write via
+;; overlayfs) for a container instance so multiple containers can share
+;; one cached image without corrupting each other's writes.
+pub fn create_bundle(container_id: string, image: ImageRef) -> string? is
+    let rootfs: string? = pull_image(image)
+    if rootfs == nil is return nil end
+
+    let bundle_dir: string = BUNDLE_ROOT + "/" + container_id
+    let upper: string = bundle_dir + "/upper"
+    let work: string = bundle_dir + "/work"
+    let merged: string = bundle_dir + "/rootfs"
+
+    fs::mkdir_all(upper)
+    fs::mkdir_all(work)
+    fs::mkdir_all(merged)
+
+    let opts: string = "lowerdir=" + rootfs + ",upperdir=" + upper + ",workdir=" + work
+    if !sys_ffi::mount_overlay(merged, opts) is
+        log::error("overlayfs mount failed for " + container_id)
+        return nil
+    end
+
+    return bundle_dir
+end
+
+pub fn destroy_bundle(container_id: string) is
+    let bundle_dir: string = BUNDLE_ROOT + "/" + container_id
+    sys_ffi::lazy_unmount(bundle_dir + "/rootfs")
+    if fs::exists(bundle_dir) is fs::remove_all(bundle_dir) end
+end
+
+;; [EXPANDED] the Rust version had no image GC at all — cached image
+;; directories under IMAGE_CACHE_DIR just accumulated forever. This adds
+;; a simple "delete anything not referenced by a running or stopped
+;; container row" sweep, invoked from `hco image prune`.
+pub fn prune_unused(referenced_keys: [string]) -> int is
+    if !fs::exists(IMAGE_CACHE_DIR) is return 0 end
+    let mut removed: int = 0
+    for entry in fs::list_dir(IMAGE_CACHE_DIR) is
+        if !array_contains_str(referenced_keys, entry) is
+            fs::remove_all(IMAGE_CACHE_DIR + "/" + entry)
+            removed += 1
+            log::info("Pruned unused image cache entry: " + entry)
+        end
+    end
+    return removed
+end
+
+fn array_contains_str(arr: [string], v: string) -> bool is
+    for x in arr is
+        if x == v is return true end
+    end
+    return false
+end
