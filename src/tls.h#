@@ -1,0 +1,13 @@
+use "std -> tls" from "tls"
+use "std -> fs" from "fs"
+
+pub fn build_server_config(cert_path: string, key_path: string) -> any? is
+    if !fs::exists(cert_path) is return nil end
+    if !fs::exists(key_path) is return nil end
+    return tls::load_cert(cert_path, key_path)
+end
+
+pub fn tls_files_present(cert: string, key: string) -> bool is
+    if cert == "" || key == "" is return false end
+    return fs::exists(cert) && fs::exists(key)
+end
