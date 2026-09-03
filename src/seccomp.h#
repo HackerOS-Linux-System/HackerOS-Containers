@@ -1,0 +1,148 @@
+use "std -> json" from "json"
+use "std -> fs" from "fs"
+use "std -> strings" from "str"
+use "std -> log" from "log"
+
+;; seccomp actions (from <linux/seccomp.h> / libseccomp's scmp_filter_ctx)
+const SCMP_ACT_KILL_PROCESS: int = 0x80000000
+const SCMP_ACT_KILL_THREAD:  int = 0x00000000
+const SCMP_ACT_TRAP:         int = 0x00030000
+const SCMP_ACT_ERRNO_BASE:   int = 0x00050000
+const SCMP_ACT_LOG:          int = 0x7ffc0000
+const SCMP_ACT_ALLOW:        int = 0x7fff0000
+
+;; architecture tokens (from <seccomp.h>)
+const SCMP_ARCH_NATIVE:  int = 0
+const SCMP_ARCH_X86:     int = 1
+const SCMP_ARCH_X86_64:  int = 0x8000003e
+const SCMP_ARCH_X32:     int = 0x4000003e
+const SCMP_ARCH_ARM:     int = 0x40000028
+const SCMP_ARCH_AARCH64: int = 0xc00000b7
+
+extern dynamic [c, "libseccomp"] is
+    fn seccomp_init(default_action: int) -> int          ;; returns opaque ctx handle (as int)
+    fn seccomp_arch_add(ctx: int, arch: int) -> int
+    fn seccomp_rule_add(ctx: int, action: int, syscall_nr: int, arg_cnt: int) -> int
+    fn seccomp_syscall_resolve_name(name: string) -> int
+    fn seccomp_load(ctx: int) -> int
+    fn seccomp_release(ctx: int)
+end
+
+struct SyscallRule is
+    names:  [string]
+    action: string
+end
+
+struct SeccompProfile is
+    default_action: string
+    architectures:  [string]
+    syscalls:       [SyscallRule]
+end
+
+fn str_to_action(s: string) -> int? is
+    if s == "SCMP_ACT_ALLOW" is return SCMP_ACT_ALLOW end
+    if s == "SCMP_ACT_KILL" is return SCMP_ACT_KILL_THREAD end
+    if s == "SCMP_ACT_KILL_PROCESS" is return SCMP_ACT_KILL_PROCESS end
+    if s == "SCMP_ACT_TRAP" is return SCMP_ACT_TRAP end
+    if s == "SCMP_ACT_LOG" is return SCMP_ACT_LOG end
+    if str::starts_with(s, "SCMP_ACT_ERRNO(") && str::ends_with(s, ")") is
+        let inner: string = str::slice(s, 15, str::len(s) - 1)
+        let n: int? = conv::str_to_int_checked(inner)
+        if n == nil is return nil end
+        return SCMP_ACT_ERRNO_BASE | (n & 0xffff)
+    end
+    return nil ;; [FIXED] no silent Allow fallback either — see doc comment
+end
+
+fn str_to_arch(s: string) -> int is
+    match s is
+        "SCMP_ARCH_X86"                    => SCMP_ARCH_X86
+        "SCMP_ARCH_X86_64" | "x86_64"       => SCMP_ARCH_X86_64
+        "SCMP_ARCH_X32"                     => SCMP_ARCH_X32
+        "SCMP_ARCH_ARM"                     => SCMP_ARCH_ARM
+        "SCMP_ARCH_AARCH64" | "aarch64"     => SCMP_ARCH_AARCH64
+        _                                   => SCMP_ARCH_NATIVE
+    end
+end
+
+fn parse_profile(content: string) -> SeccompProfile? is
+    let parsed: any? = json::parse(content)
+    if parsed == nil is return nil end
+    let root: any = parsed
+    let default_action: string = json::get_string(root, "default_action", "")
+    if default_action == "" is return nil end
+    let architectures: [string] = json::get_string_array(root, "architectures")
+    let syscalls_raw: [any] = json::get_array(root, "syscalls")
+
+    let mut syscalls: [SyscallRule] = []
+    for item in syscalls_raw is
+        syscalls = array_push(syscalls, SyscallRule {
+            names: json::get_string_array(item, "names"),
+            action: json::get_string(item, "action", "")
+        })
+    end
+    return SeccompProfile { default_action: default_action, architectures: architectures, syscalls: syscalls }
+end
+
+pub fn apply_seccomp(profile_path: string) -> bool is
+    if !fs::exists(profile_path) is
+        log::error("Failed to read seccomp profile '" + profile_path + "': not found")
+        return false
+    end
+    let content: string = fs::read(profile_path)
+    let maybe_profile: SeccompProfile? = parse_profile(content)
+    if maybe_profile == nil is
+        log::error("Invalid seccomp profile: " + profile_path)
+        return false
+    end
+    let profile: SeccompProfile = maybe_profile
+
+    let default_action: int? = str_to_action(profile.default_action)
+    if default_action == nil is
+        log::error("Unknown default_action '" + profile.default_action + "' in " + profile_path)
+        return false
+    end
+
+    let ctx: int = seccomp_init(default_action)
+    if ctx == 0 is
+        log::error("Cannot create seccomp filter")
+        return false
+    end
+
+    for arch in profile.architectures is
+        if seccomp_arch_add(ctx, str_to_arch(arch)) != 0 is
+            log::warn("Cannot add seccomp arch " + arch)
+        end
+    end
+
+    for rule in profile.syscalls is
+        let action: int? = str_to_action(rule.action)
+        if action == nil is
+            log::error("Unknown action '" + rule.action + "' for a syscall rule — refusing to load filter")
+            seccomp_release(ctx)
+            return false
+        end
+        for name in rule.names is
+            let nr: int = seccomp_syscall_resolve_name(name)
+            if nr < 0 is
+                log::error("Unknown syscall '" + name + "'")
+                seccomp_release(ctx)
+                return false
+            end
+            if seccomp_rule_add(ctx, action, nr, 0) != 0 is
+                log::error("Cannot add rule for '" + name + "'")
+                seccomp_release(ctx)
+                return false
+            end
+        end
+    end
+
+    if seccomp_load(ctx) != 0 is
+        log::error("Cannot load seccomp filter")
+        seccomp_release(ctx)
+        return false
+    end
+
+    seccomp_release(ctx)
+    return true
+end
