@@ -1,0 +1,89 @@
+pub const CLONE_NEWNS:    int = 0x00020000
+pub const CLONE_NEWUTS:   int = 0x04000000
+pub const CLONE_NEWIPC:   int = 0x08000000
+pub const CLONE_NEWUSER:  int = 0x10000000
+pub const CLONE_NEWPID:   int = 0x20000000
+pub const CLONE_NEWNET:   int = 0x40000000
+
+pub const MS_BIND:   int = 4096
+pub const MS_REC:    int = 16384
+pub const MNT_DETACH: int = 2
+
+pub const SIGTERM: int = 15
+pub const SIGKILL: int = 9
+pub const SIGCHLD: int = 17
+
+extern static [c] is
+    ;; process / namespace control
+    fn unshare(flags: int) -> int
+    fn setns(fd: int, nstype: int) -> int
+    fn syscall_clone(flags: int, child_stack: int) -> int
+    fn fork_raw() -> int
+    fn execve_raw(path: string, argv: string, envp: string) -> int
+    fn waitpid_raw(pid: int, options: int) -> int
+    fn kill_raw(pid: int, sig: int) -> int
+    fn getpid_raw() -> int
+    fn getuid_raw() -> int
+    fn getgid_raw() -> int
+    fn setuid_raw(uid: int) -> int
+    fn setgid_raw(gid: int) -> int
+    fn sethostname_raw(name: string, len: int) -> int
+    fn chdir_raw(path: string) -> int
+    fn setsid_raw() -> int
+
+    ;; mount family
+    fn mount_raw(src: string, target: string, fstype: string, flags: int, data: string) -> int
+    fn umount2_raw(target: string, flags: int) -> int
+    fn pivot_root_raw(new_root: string, old_root: string) -> int
+
+    ;; pty
+    fn openpty_raw(master_out: int, slave_out: int) -> int
+    fn dup2_raw(oldfd: int, newfd: int) -> int
+end
+
+;; ── Friendly wrappers ─────────────────────────────────────────────────────────
+
+pub fn is_root() -> bool is
+    return getuid_raw() == 0
+end
+
+pub fn current_pid() -> int is
+    return getpid_raw()
+end
+
+pub fn bind_mount(src: string, target: string) -> bool is
+    return mount_raw(src, target, "", MS_BIND | MS_REC, "") == 0
+end
+
+pub fn mount_pseudo(fstype: string, target: string) -> bool is
+    return mount_raw(fstype, target, fstype, 0, "") == 0
+end
+
+pub fn mount_overlay(target: string, opts: string) -> bool is
+    return mount_raw("overlay", target, "overlay", 0, opts) == 0
+end
+
+pub fn lazy_unmount(target: string) -> bool is
+    return umount2_raw(target, MNT_DETACH) == 0
+end
+
+pub fn pivot(new_root: string, old_root_rel: string) -> bool is
+    return pivot_root_raw(new_root, old_root_rel) == 0
+end
+
+pub fn set_hostname(name: string) -> bool is
+    return sethostname_raw(name, string_len(name)) == 0
+end
+
+pub fn signal_process(pid: int, sig: int) -> bool is
+    return kill_raw(pid, sig) == 0
+end
+
+;; Non-blocking waitpid — returns true when the child has already exited.
+pub fn try_reap(pid: int) -> bool is
+    return waitpid_raw(pid, 1) > 0 ;; WNOHANG = 1
+end
+
+pub fn blocking_wait(pid: int) -> int is
+    return waitpid_raw(pid, 0)
+end
