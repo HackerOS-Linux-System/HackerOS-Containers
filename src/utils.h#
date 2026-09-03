@@ -1,0 +1,51 @@
+use "std -> strings" from "str"
+use "std -> fs" from "fs"
+use "std -> path" from "path"
+use "std -> crypto" from "crypto"
+
+;; Parse a human memory size ("512MB", "2GB", "100KB", "10B", or a bare
+;; number of bytes) into a byte count. Unknown/garbage input -> 0, same
+;; behaviour as the original `unwrap_or(0)`.
+pub fn parse_bytes(raw: string) -> int is
+    let s: string = str::to_upper(raw)
+    if str::ends_with(s, "GB") is
+        return conv::str_to_int(str::slice(s, 0, str::len(s) - 2)) * 1073741824
+    end
+    if str::ends_with(s, "MB") is
+        return conv::str_to_int(str::slice(s, 0, str::len(s) - 2)) * 1048576
+    end
+    if str::ends_with(s, "KB") is
+        return conv::str_to_int(str::slice(s, 0, str::len(s) - 2)) * 1024
+    end
+    if str::ends_with(s, "B") is
+        return conv::str_to_int(str::slice(s, 0, str::len(s) - 1))
+    end
+    return conv::str_to_int(s)
+end
+
+;; Locally-administered, unicast random MAC — the leading octet is fixed
+;; to 0x02 for the same reason the Rust version did (bit 0 = unicast,
+;; bit 1 = locally administered).
+pub fn random_mac() -> string is
+    let bytes: bytes = crypto::random_bytes(5)
+    let mut parts: [string] = [conv::int_to_hex_padded(2, 2)]
+    let mut i: int = 0
+    while i < 5 is
+        parts = array_push(parts, conv::int_to_hex_padded(buf::byte_at(bytes, i), 2))
+        i += 1
+    end
+    return str::join(parts, ":")
+end
+
+pub fn write_to_file(target_path: string, content: string) -> bool is
+    let parent: string = path::parent(target_path)
+    if parent != "" && !fs::exists(parent) is
+        fs::mkdir_all(parent)
+    end
+    return fs::write(target_path, content)
+end
+
+pub fn read_file(target_path: string) -> string? is
+    if !fs::exists(target_path) is return nil end
+    return fs::read(target_path)
+end
