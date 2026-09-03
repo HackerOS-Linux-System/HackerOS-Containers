@@ -1,1 +1,17 @@
+[package]
+-> name        => hco
+-> version     => 0.4.0
+-> description => Advanced container runtime with user namespaces, seccomp, CNI, REST API — H# port of HackerOS-Containers
+-> author      => HackerOS Team <hackeros068@gmail.com>
+-> license     => MIT
 
+[build]
+-> lang     => h#
+-> entry    => src/main.h#
+-> output   => build/hco
+-> emit     => bin
+-> flags    => --release
+-> mem-mode => safety
+
+[deps]
+-> libc => dynamic
