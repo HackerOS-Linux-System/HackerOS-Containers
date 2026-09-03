@@ -1,0 +1,143 @@
+use "std -> uuid" from "uuid"
+use "std -> time" from "time"
+use "std -> log" from "log"
+use "std -> json" from "json"
+
+mod db
+mod container
+mod validation
+mod network
+mod sandbox
+
+pub struct PodCreateOptions is
+    pub name:           string
+    pub shared_network: bool
+    pub shared_pid:     bool
+    pub shared_ipc:     bool
+    pub cni_network:    string
+end
+
+pub struct OpError is
+    pub message: string
+end
+
+pub fn op_err(msg: string) -> OpError is
+    return OpError { message: msg }
+end
+
+pub fn op_error_message(e: OpError) -> string is return e.message end
+
+
+pub fn create_pod(opts: PodCreateOptions) -> (string, OpError?) is
+    let name_err: validation::ValidationError? = validation::validate_name(opts.name)
+    if name_err != nil is return ("", op_err(validation::validation_error_message(name_err))) end
+
+    if db::find_pod(opts.name) != nil is
+        return ("", op_err("A pod named '" + opts.name + "' already exists"))
+    end
+
+    ;; "pause" container: an infinitely-sleeping minimal container that
+    ;; owns the shared namespaces for the pod's lifetime, same trick
+    ;; Kubernetes' CRI implementations use.
+    let pause_opts: container::CreateOptions = container::CreateOptions {
+        name: opts.name + "-pause", image_ref: "hco/pause:latest", mounts: [], ports: [],
+        env: [], memory_limit: "16MB", cpu_percent: 0, cni_network: opts.cni_network,
+        rootless: false, readonly_root: true, auto_restart: true, seccomp: "", pod_id: opts.name
+    }
+    let created: (string, container::OpError?) = container::create_container(pause_opts)
+    if created.1 != nil is return ("", op_err("Failed to create pause container: " + container::op_error_message(created.1))) end
+
+    let netns_path: string = if opts.shared_network then "/proc/" + created.0 + "/ns/net" else ""
+
+    let row: db::PodRow = db::PodRow {
+        name: opts.name, container_ids_json: json::stringify_string_array([created.0]),
+        status: "Running", shared_network: opts.shared_network, shared_pid: opts.shared_pid,
+        shared_ipc: opts.shared_ipc, netns_path: netns_path, spec_json: "{}", created_at: time::now_rfc3339()
+    }
+    db::insert_pod(row)
+    log::info("Pod '" + opts.name + "' created with pause container " + created.0)
+    return (opts.name, nil)
+end
+
+pub fn add_container_to_pod(pod_name: string, container_id: string) -> OpError? is
+    let row: db::PodRow? = db::find_pod(pod_name)
+    if row == nil is return op_err("No such pod: " + pod_name) end
+    let ids: [string] = db::pod_container_ids(row)
+    let updated: [string] = array_push(ids, container_id)
+    db::insert_pod(db::PodRow {
+        name: db::pod_row_name(row), container_ids_json: json::stringify_string_array(updated),
+        status: db::pod_row_status(row), shared_network: db::pod_row_shared_network(row), shared_pid: db::pod_row_shared_pid(row),
+        shared_ipc: db::pod_row_shared_ipc(row), netns_path: db::pod_row_netns_path(row), spec_json: db::pod_row_spec_json(row),
+        created_at: db::pod_row_created_at(row)
+    })
+    return nil
+end
+
+pub fn stop_pod(pod_name: string) -> OpError? is
+    let row: db::PodRow? = db::find_pod(pod_name)
+    if row == nil is return op_err("No such pod: " + pod_name) end
+    let ids: [string] = db::pod_container_ids(row)
+    let row_name: string = db::pod_row_name(row)
+    let row_netns_path: string = db::pod_row_netns_path(row)
+
+    ;; [FIXED] collect per-container failures instead of assuming success.
+    let mut failures: [string] = []
+    for cid in ids is
+        let result: container::OpError? = container::stop_container(cid, 5000)
+        if result != nil is
+            failures = array_push(failures, cid + ": " + container::op_error_message(result))
+        end
+    end
+
+    if row_netns_path != "" is
+        network::cleanup_cni(row_name, row_name)
+    end
+
+    if array_len(failures) > 0 is
+        return op_err("Some containers in pod '" + pod_name + "' failed to stop: " + str_join_semicolons(failures))
+    end
+
+    db::insert_pod(db::PodRow {
+        name: row_name, container_ids_json: db::pod_row_container_ids_json(row), status: "Stopped",
+        shared_network: db::pod_row_shared_network(row), shared_pid: db::pod_row_shared_pid(row), shared_ipc: db::pod_row_shared_ipc(row),
+        netns_path: row_netns_path, spec_json: db::pod_row_spec_json(row), created_at: db::pod_row_created_at(row)
+    })
+    log::info("Pod '" + pod_name + "' stopped")
+    return nil
+end
+
+fn str_join_semicolons(items: [string]) -> string is
+    let mut out: string = ""
+    let mut first: bool = true
+    for i in items is
+        if !first is out += "; " end
+        out += i
+        first = false
+    end
+    return out
+end
+
+pub fn remove_pod(pod_name: string, force: bool) -> OpError? is
+    let row: db::PodRow? = db::find_pod(pod_name)
+    if row == nil is return op_err("No such pod: " + pod_name) end
+
+    if db::pod_row_status(row) == "Running" is
+        if !force is return op_err("Pod '" + pod_name + "' is running; use --force to remove") end
+        stop_pod(pod_name)
+    end
+
+    for cid in db::pod_container_ids(row) is
+        container::remove_container(cid, true)
+    end
+    db::delete_pod(pod_name)
+    log::info("Pod '" + pod_name + "' removed")
+    return nil
+end
+
+pub fn list_pods(page: int, per_page: int) -> ([db::PodRow], int) is
+    return db::list_pods_paged(page, per_page)
+end
+
+pub fn inspect_pod(pod_name: string) -> db::PodRow? is
+    return db::find_pod(pod_name)
+end
