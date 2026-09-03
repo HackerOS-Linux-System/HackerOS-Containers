@@ -1,0 +1,292 @@
+use "std -> json" from "json"
+use "std -> strings" from "str"
+
+pub struct Metadata is
+    pub name:    string
+    pub version: string
+    pub authors: string
+    pub license: string
+end
+
+pub struct Specs is
+    pub base_image:    string
+    pub memory_limit:  string ;; "" == None
+    pub cpu_percent:   int    ;; 0 == None
+    pub mounts:        [string]
+    pub port_mappings: [string]
+    pub env:           [string]
+    pub cmd:           [string]
+end
+
+pub struct RuntimeCfg is
+    pub auto_restart: bool
+    pub network_mode: string
+    pub cni_network:  string ;; "" == None
+end
+
+pub struct Security is
+    pub drop_caps:         [string]
+    pub readonly_root:     bool
+    pub allow_raw_sockets: bool
+    pub rootless:          bool
+    pub seccomp_profile:   string ;; "" == None
+end
+
+pub struct NetworkConfig is
+    pub bridge_name: string
+    pub subnet:      string
+    pub gateway:     string
+    pub ip_range:    string
+    pub dns_servers: [string]
+end
+
+pub struct HkConfig is
+    pub metadata: Metadata
+    pub specs:    Specs
+    pub runtime:  RuntimeCfg
+    pub security: Security
+    pub network:  NetworkConfig
+end
+
+pub const HCO_VERSION: string = "0.4.0"
+
+pub fn default_security() -> Security is
+    ;; [FIXED] see module doc comment — CAP_NET_RAW now tracks
+    ;; allow_raw_sockets instead of being silently ignored.
+    return Security {
+        drop_caps: ["CAP_SYS_ADMIN"],
+        readonly_root: false,
+        allow_raw_sockets: true,
+        rootless: false,
+        seccomp_profile: ""
+    }
+end
+
+pub fn default_network() -> NetworkConfig is
+    return NetworkConfig {
+        bridge_name: "hkbr0",
+        subnet: "10.10.0.0/24",
+        gateway: "10.10.0.1",
+        ip_range: "10.10.0.2-10.10.0.254",
+        dns_servers: []
+    }
+end
+
+;; ── Factory ───────────────────────────────────────────────────────────────────
+
+pub fn create_ephemeral(name: string, image: string, mounts: [string], ports: [string]) -> HkConfig is
+    return HkConfig {
+        metadata: Metadata { name: name, version: HCO_VERSION, authors: "", license: "" },
+        specs: Specs {
+            base_image: image, memory_limit: "", cpu_percent: 0,
+            mounts: mounts, port_mappings: ports, env: [], cmd: []
+        },
+        runtime: RuntimeCfg { auto_restart: false, network_mode: "bridge", cni_network: "" },
+        security: default_security(),
+        network: default_network()
+    }
+end
+
+;; ── JSON (de)serialisation — replaces #[derive(Serialize, Deserialize)] ────────
+
+pub fn config_to_json(c: HkConfig) -> string is
+    let mut root: any = json::object()
+    let mut meta: any = json::object()
+    json::set(meta, "name", c.metadata.name)
+    json::set(meta, "version", c.metadata.version)
+    json::set(meta, "authors", c.metadata.authors)
+    json::set(meta, "license", c.metadata.license)
+
+    let mut specs: any = json::object()
+    json::set(specs, "base_image", c.specs.base_image)
+    json::set(specs, "memory_limit", c.specs.memory_limit)
+    json::set(specs, "cpu_percent", c.specs.cpu_percent)
+    json::set(specs, "mounts", c.specs.mounts)
+    json::set(specs, "port_mappings", c.specs.port_mappings)
+    json::set(specs, "env", c.specs.env)
+    json::set(specs, "cmd", c.specs.cmd)
+
+    let mut rt: any = json::object()
+    json::set(rt, "auto_restart", c.runtime.auto_restart)
+    json::set(rt, "network_mode", c.runtime.network_mode)
+    json::set(rt, "cni_network", c.runtime.cni_network)
+
+    let mut sec: any = json::object()
+    json::set(sec, "drop_caps", c.security.drop_caps)
+    json::set(sec, "readonly_root", c.security.readonly_root)
+    json::set(sec, "allow_raw_sockets", c.security.allow_raw_sockets)
+    json::set(sec, "rootless", c.security.rootless)
+    json::set(sec, "seccomp_profile", c.security.seccomp_profile)
+
+    let mut net: any = json::object()
+    json::set(net, "bridge_name", c.network.bridge_name)
+    json::set(net, "subnet", c.network.subnet)
+    json::set(net, "gateway", c.network.gateway)
+    json::set(net, "ip_range", c.network.ip_range)
+    json::set(net, "dns_servers", c.network.dns_servers)
+
+    json::set(root, "metadata", meta)
+    json::set(root, "specs", specs)
+    json::set(root, "runtime", rt)
+    json::set(root, "security", sec)
+    json::set(root, "network", net)
+    return json::stringify(root)
+end
+
+pub fn config_from_json(text: string) -> HkConfig? is
+    let parsed: any? = json::parse(text)
+    if parsed == nil is return nil end
+    let root: any = parsed
+    let meta: any = json::get(root, "metadata")
+    let specs: any = json::get(root, "specs")
+    let rt: any = json::get(root, "runtime")
+    let sec: any = json::get(root, "security")
+    let net: any = json::get(root, "network")
+
+    return HkConfig {
+        metadata: Metadata {
+            name: json::get_string(meta, "name", "unknown"),
+            version: json::get_string(meta, "version", HCO_VERSION),
+            authors: json::get_string(meta, "authors", ""),
+            license: json::get_string(meta, "license", "")
+        },
+        specs: Specs {
+            base_image: json::get_string(specs, "base_image", "alpine:latest"),
+            memory_limit: json::get_string(specs, "memory_limit", ""),
+            cpu_percent: json::get_int(specs, "cpu_percent", 0),
+            mounts: json::get_string_array(specs, "mounts"),
+            port_mappings: json::get_string_array(specs, "port_mappings"),
+            env: json::get_string_array(specs, "env"),
+            cmd: json::get_string_array(specs, "cmd")
+        },
+        runtime: RuntimeCfg {
+            auto_restart: json::get_bool(rt, "auto_restart", false),
+            network_mode: json::get_string(rt, "network_mode", "bridge"),
+            cni_network: json::get_string(rt, "cni_network", "")
+        },
+        security: Security {
+            drop_caps: json::get_string_array(sec, "drop_caps"),
+            readonly_root: json::get_bool(sec, "readonly_root", false),
+            allow_raw_sockets: json::get_bool(sec, "allow_raw_sockets", true),
+            rootless: json::get_bool(sec, "rootless", false),
+            seccomp_profile: json::get_string(sec, "seccomp_profile", "")
+        },
+        network: NetworkConfig {
+            bridge_name: json::get_string(net, "bridge_name", "hkbr0"),
+            subnet: json::get_string(net, "subnet", "10.10.0.0/24"),
+            gateway: json::get_string(net, "gateway", "10.10.0.1"),
+            ip_range: json::get_string(net, "ip_range", "10.10.0.2-10.10.0.254"),
+            dns_servers: json::get_string_array(net, "dns_servers")
+        }
+    }
+end
+
+;; ── .hk config file parser (INI-style, same grammar as the Rust version) ───────
+
+fn csv_list(value: string) -> [string] is
+    if value == "" is return [] end
+    let parts: [string] = str::split(value, ",")
+    let mut out: [string] = []
+    for p in parts is
+        let t: string = str::trim(p)
+        if t != "" is out = array_push(out, t) end
+    end
+    return out
+end
+
+pub fn parse_hk_file(input: string) -> HkConfig? is
+    let mut sections: HashMap<string, HashMap<string, string>> = collections::new_map()
+    let mut current: string = ""
+
+    for raw_line in str::split(input, "\n") is
+        let line: string = str::trim(raw_line)
+        if line == "" || str::starts_with(line, "!") is continue end
+
+        if str::starts_with(line, "[") && str::ends_with(line, "]") is
+            current = str::slice(line, 1, str::len(line) - 1)
+            collections::map_ensure(sections, current)
+            continue
+        end
+
+        let eq: int = str::find(line, "=")
+        if eq >= 0 is
+            let key: string = str::trim(str::slice(line, 0, eq))
+            let value: string = str::trim(str::trim_matches(str::slice(line, eq + 1, str::len(line)), "\""))
+            if current != "" is
+                collections::map_insert_nested(sections, current, key, value)
+            end
+        end
+    end
+
+    if !collections::map_has(sections, "Metadata") is return nil end
+
+    let meta: HashMap<string, string> = collections::map_get(sections, "Metadata")
+    let specs_map: HashMap<string, string> = collections::map_get_or_empty(sections, "Specs")
+    let runtime_map: HashMap<string, string> = collections::map_get_or_empty(sections, "Runtime")
+    let security_map: HashMap<string, string> = collections::map_get_or_empty(sections, "Security")
+    let network_map: HashMap<string, string> = collections::map_get_or_empty(sections, "Network")
+
+    return HkConfig {
+        metadata: Metadata {
+            name: collections::map_get_str(meta, "name", "unknown"),
+            version: collections::map_get_str(meta, "version", HCO_VERSION),
+            authors: collections::map_get_str(meta, "authors", ""),
+            license: collections::map_get_str(meta, "license", "")
+        },
+        specs: Specs {
+            base_image: collections::map_get_str(specs_map, "base_image", "alpine:latest"),
+            memory_limit: collections::map_get_str(specs_map, "memory_limit", ""),
+            cpu_percent: conv::str_to_int(collections::map_get_str(specs_map, "cpu_percent", "0")),
+            mounts: csv_list(collections::map_get_str(specs_map, "mounts", "")),
+            port_mappings: csv_list(collections::map_get_str(specs_map, "port_mappings", "")),
+            env: csv_list(collections::map_get_str(specs_map, "env", "")),
+            cmd: csv_list(collections::map_get_str(specs_map, "cmd", ""))
+        },
+        runtime: RuntimeCfg {
+            auto_restart: collections::map_get_str(runtime_map, "auto_restart", "false") == "true",
+            network_mode: collections::map_get_str(runtime_map, "network_mode", "bridge"),
+            cni_network: collections::map_get_str(runtime_map, "cni_network", "")
+        },
+        security: Security {
+            drop_caps: csv_list(collections::map_get_str(security_map, "drop_caps", "")),
+            readonly_root: collections::map_get_str(security_map, "readonly_root", "false") == "true",
+            allow_raw_sockets: collections::map_get_str(security_map, "allow_raw_sockets", "true") != "false",
+            rootless: collections::map_get_str(security_map, "rootless", "false") == "true",
+            seccomp_profile: collections::map_get_str(security_map, "seccomp_profile", "")
+        },
+        network: NetworkConfig {
+            bridge_name: collections::map_get_str(network_map, "bridge_name", "hkbr0"),
+            subnet: collections::map_get_str(network_map, "subnet", "10.10.0.0/24"),
+            gateway: collections::map_get_str(network_map, "gateway", "10.10.0.1"),
+            ip_range: collections::map_get_str(network_map, "ip_range", "10.10.0.2-10.10.0.254"),
+            dns_servers: csv_list(collections::map_get_str(network_map, "dns_servers", ""))
+        }
+    }
+end
+
+pub fn config_from_file(path: string) -> HkConfig? is
+    if !fs::exists(path) is return nil end
+    let content: string = fs::read(path)
+    return parse_hk_file(content)
+end
+
+;; [FIXED] container.h# used to read `cfg.specs.mounts`, `cfg.security.rootless`,
+;; etc. directly off an `HkConfig` value — a cross-module nested-field
+;; chain into a struct defined here. `Specs.mounts`/`.env`/`.cpu_percent`/
+;; `.memory_limit`, `Security.drop_caps`/`.rootless`/`.readonly_root`/
+;; `.seccomp_profile` and `RuntimeCfg.cni_network` all collide with field
+;; names on other structs (`CreateOptions`, `SandboxSpec`, `ContainerStats`,
+;; `PodCreateOptions`), which is exactly the pattern that made the h# v0.8
+;; compiler misresolve fields in `bytes` itself (see `BYTES_FIX_NOTES.md`
+;; in the bytes-main port). Same-module accessors avoid it.
+pub fn cfg_mounts(cfg: HkConfig) -> [string] is return cfg.specs.mounts end
+pub fn cfg_port_mappings(cfg: HkConfig) -> [string] is return cfg.specs.port_mappings end
+pub fn cfg_env(cfg: HkConfig) -> [string] is return cfg.specs.env end
+pub fn cfg_cmd(cfg: HkConfig) -> [string] is return cfg.specs.cmd end
+pub fn cfg_memory_limit(cfg: HkConfig) -> string is return cfg.specs.memory_limit end
+pub fn cfg_cpu_percent(cfg: HkConfig) -> int is return cfg.specs.cpu_percent end
+pub fn cfg_cni_network(cfg: HkConfig) -> string is return cfg.runtime.cni_network end
+pub fn cfg_rootless(cfg: HkConfig) -> bool is return cfg.security.rootless end
+pub fn cfg_readonly_root(cfg: HkConfig) -> bool is return cfg.security.readonly_root end
+pub fn cfg_seccomp_profile(cfg: HkConfig) -> string is return cfg.security.seccomp_profile end
+pub fn cfg_drop_caps(cfg: HkConfig) -> [string] is return cfg.security.drop_caps end
