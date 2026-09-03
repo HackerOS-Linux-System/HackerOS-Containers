@@ -2,3 +2,10 @@
 
 ^> curl -L "https://github.com/HackerOS-Linux-System/HackerOS-Containers/releases/download/v0.4/hco" -o /usr/bin/hco
 ^> chmod a+x /usr/bin/hco
+^> mkdir -p /etc/cni/net.d
+^> mkdir -p /var/lib/hco/images
+^> mkdir -p /var/lib/hco/bundles
+^> mkdir -p /var/log/hco/containers
+^> curl -sSL https://raw.githubusercontent.com/HackerOS-Linux-System/HackerOS-Containers/main/services/hco-api.service -o /etc/systemd/system/hco-api.service
+^> curl -sSL https://raw.githubusercontent.com/HackerOS-Linux-System/HackerOS-Containers/main/services/hco-api.socket -o /etc/systemd/system/hco-api.socket
+^> systemctl daemon-reload
