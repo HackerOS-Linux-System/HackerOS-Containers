@@ -1,0 +1,148 @@
+use "std -> strings" from "str"
+use "std -> regex" from "re"
+
+pub struct ValidationError is
+    pub message: string
+end
+
+pub fn validation_error_message(e: ValidationError) -> string is return e.message end
+
+fn err(msg: string) -> ValidationError is
+    return ValidationError { message: msg }
+end
+
+pub fn validate_name(name: string) -> ValidationError? is
+    if name == "" is return err("Name cannot be empty") end
+    if str::len(name) > 128 is return err("Name too long (max 128 chars)") end
+    if !re::is_match(name, "^[a-zA-Z0-9_\\-]+$") is
+        return err("Invalid name '" + name + "': only alphanumeric, dash, underscore allowed")
+    end
+    return nil
+end
+
+pub fn validate_image_ref(image: string) -> ValidationError? is
+    if image == "" is return err("Image reference cannot be empty") end
+    if str::len(image) > 512 is return err("Image reference too long") end
+    let forbidden: [string] = ["`", "$", ";", "&", "|", ">", "<", "(", ")", "{", "}", "\\"]
+    for ch in forbidden is
+        if str::contains(image, ch) is
+            return err("Invalid character '" + ch + "' in image reference")
+        end
+    end
+    return nil
+end
+
+;; Result-ish triple: (host_path, container_path, options, error)
+pub struct MountSpec is
+    pub host_path:      string
+    pub container_path: string
+    pub options:        string ;; "" == None
+    pub error:          string ;; "" == ok
+end
+
+fn blocked_host_path(host_path: string) -> bool is
+    let normalized: string = if str::ends_with(host_path, "/") && str::len(host_path) > 1
+        then str::slice(host_path, 0, str::len(host_path) - 1)
+        else host_path
+    let blocked: [string] = ["/proc", "/sys", "/dev", "/run/hackeros", "/etc/shadow", "/etc/passwd", "/root", "/etc"]
+    for b in blocked is
+        ;; [FIXED] exact-match OR "starts with b + /" — the old Rust
+        ;; `starts_with(b)` alone would also match "/etcfoo" as blocked
+        ;; by "/etc", which is a false positive; this is the corrected,
+        ;; boundary-aware version of the same check.
+        if normalized == b || str::starts_with(normalized, b + "/") is return true end
+    end
+    return false
+end
+
+fn canonicalize_host_path(raw: string) -> string is
+    if raw == "" is return "" end
+    if !str::starts_with(raw, "/") is return "" end
+    for part in str::split(raw, "/") is
+        if part == ".." is return "" end
+    end
+    return raw
+end
+
+fn sanitize_container_path(raw: string) -> string is
+    if raw == "" is return "" end
+    for part in str::split(raw, "/") is
+        if part == ".." is return "" end
+    end
+    if str::starts_with(raw, "/") is return raw end
+    return "/" + raw
+end
+
+pub fn validate_mount(mount_spec: string) -> MountSpec is
+    let parts: [string] = str::splitn(mount_spec, ":", 3)
+    if array_len(parts) < 2 is
+        return MountSpec { host_path: "", container_path: "", options: "",
+                            error: "Invalid mount spec '" + mount_spec + "': expected host:container" }
+    end
+
+    let host: string = canonicalize_host_path(parts[0])
+    if host == "" is
+        return MountSpec { host_path: "", container_path: "", options: "",
+                            error: "Mount host path must be absolute and traversal-free: '" + parts[0] + "'" }
+    end
+
+    let container: string = sanitize_container_path(parts[1])
+    if container == "" is
+        return MountSpec { host_path: "", container_path: "", options: "",
+                            error: "Path traversal in container path: '" + parts[1] + "'" }
+    end
+
+    if blocked_host_path(host) is
+        return MountSpec { host_path: "", container_path: "", options: "",
+                            error: "Mount of sensitive path '" + host + "' is not allowed" }
+    end
+
+    let opts: string = if array_len(parts) > 2 then parts[2] else ""
+    return MountSpec { host_path: host, container_path: container, options: opts, error: "" }
+end
+
+pub fn validate_port_mapping(port_spec: string) -> ValidationError? is
+    if !re::is_match(port_spec, "^(\\d{1,5}):(\\d{1,5})(/(tcp|udp))?$") is
+        return err("Invalid port mapping '" + port_spec + "': use host:container[/tcp|udp]")
+    end
+    let parts: [string] = str::split(port_spec, ":")
+    let host_port: int = conv::str_to_int(parts[0])
+    let cp_part: [string] = str::split(parts[1], "/")
+    let container_port: int = conv::str_to_int(cp_part[0])
+    if host_port == 0 || container_port == 0 is return err("Port numbers must be > 0") end
+    if host_port > 65535 || container_port > 65535 is return err("Port numbers must be <= 65535") end
+    return nil
+end
+
+pub fn validate_env_var(env_spec: string) -> ValidationError? is
+    let eq: int = str::find(env_spec, "=")
+    if eq < 0 is return err("Invalid env var '" + env_spec + "': must be KEY=VALUE") end
+    let key: string = str::slice(env_spec, 0, eq)
+    if key == "" is return err("Env var key cannot be empty") end
+    if !re::is_match(key, "^[A-Za-z_][A-Za-z0-9_]*$") is
+        return err("Invalid env var key '" + key + "'")
+    end
+    return nil
+end
+
+pub fn validate_cni_network_name(name: string) -> ValidationError? is
+    if name == "" is return err("CNI network name cannot be empty") end
+    if !re::is_match(name, "^[a-zA-Z0-9_\\-]+$") is
+        return err("Invalid CNI network name '" + name + "'")
+    end
+    return nil
+end
+
+pub fn validate_memory_limit(limit: string) -> ValidationError? is
+    if !re::is_match(str::to_upper(limit), "^\\d+(B|KB|MB|GB)$") is
+        return err("Invalid memory limit '" + limit + "': use e.g. 512MB or 2GB")
+    end
+    return nil
+end
+
+pub fn validate_cpu_percent(pct: int) -> ValidationError? is
+    if pct == 0 || pct > 100 is
+        return err("cpu_percent must be 1-100, got " + to_string(pct))
+    end
+    return nil
+end
