@@ -1,0 +1,291 @@
+use "std -> uuid" from "uuid"
+use "std -> time" from "time"
+use "std -> log" from "log"
+use "std -> json" from "json"
+use "std -> fs" from "fs"
+use "std -> strings" from "str"
+
+mod config
+mod validation
+mod db
+mod image
+mod sandbox
+mod sys_ffi
+mod network
+mod logging
+mod metrics
+mod utils
+
+const GRACE_PERIOD_MS: int = 5000
+const POLL_INTERVAL_MS: int = 100
+const LOG_ROOT: string = "/var/log/hco/containers"
+
+pub struct CreateOptions is
+    pub name:          string
+    pub image_ref:     string
+    pub mounts:        [string]
+    pub ports:         [string]
+    pub env:           [string]
+    pub memory_limit:  string
+    pub cpu_percent:   int
+    pub cni_network:   string ;; "" == bridge mode
+    pub rootless:      bool
+    pub readonly_root: bool
+    pub auto_restart:  bool
+    pub seccomp:       string
+    pub pod_id:        string ;; "" == none
+end
+
+pub struct OpError is
+    pub message: string
+end
+
+pub fn op_error_message(e: OpError) -> string is return e.message end
+
+
+fn op_err(msg: string) -> OpError is
+    return OpError { message: msg }
+end
+
+pub fn create_container(opts: CreateOptions) -> (string, OpError?) is
+    let name_err: validation::ValidationError? = validation::validate_name(opts.name)
+    if name_err != nil is return ("", op_err(validation::validation_error_message(name_err))) end
+
+    let image_err: validation::ValidationError? = validation::validate_image_ref(opts.image_ref)
+    if image_err != nil is return ("", op_err(validation::validation_error_message(image_err))) end
+
+    for m in opts.mounts is
+        let spec: validation::MountSpec = validation::validate_mount(m)
+        if spec.error != "" is return ("", op_err(spec.error)) end
+    end
+    for p in opts.ports is
+        let perr: validation::ValidationError? = validation::validate_port_mapping(p)
+        if perr != nil is return ("", op_err(validation::validation_error_message(perr))) end
+    end
+    for e in opts.env is
+        let eerr: validation::ValidationError? = validation::validate_env_var(e)
+        if eerr != nil is return ("", op_err(validation::validation_error_message(eerr))) end
+    end
+    if opts.memory_limit != "" is
+        let merr: validation::ValidationError? = validation::validate_memory_limit(opts.memory_limit)
+        if merr != nil is return ("", op_err(validation::validation_error_message(merr))) end
+    end
+    if opts.cpu_percent != 0 is
+        let cerr: validation::ValidationError? = validation::validate_cpu_percent(opts.cpu_percent)
+        if cerr != nil is return ("", op_err(validation::validation_error_message(cerr))) end
+    end
+
+    if db::find_container(opts.name) != nil is
+        return ("", op_err("A container named '" + opts.name + "' already exists"))
+    end
+
+    let container_id: string = uuid::v4()
+    let image_ref: image::ImageRef = image::parse_image_ref(opts.image_ref)
+    let bundle_path: string? = image::create_bundle(container_id, image_ref)
+    if bundle_path == nil is return ("", op_err("Failed to prepare image bundle for " + opts.image_ref)) end
+
+    let cfg: config::HkConfig = config::create_ephemeral(opts.name, opts.image_ref, opts.mounts, opts.ports)
+
+    let pid: int? = spawn_sandboxed(container_id, bundle_path, opts, cfg)
+    if pid == nil is
+        image::destroy_bundle(container_id)
+        return ("", op_err("Failed to start container process"))
+    end
+
+    let mut ip_address: string = ""
+    let mut veth_host: string = ""
+
+    if opts.cni_network != "" is
+        if !network::setup_cni(opts.cni_network, container_id) is
+            log::warn("CNI network setup failed for " + container_id + ", continuing without networking")
+        end
+    else is
+        let allocated: string? = db::ipam_allocate(container_id, "10.10.0")
+        if allocated != nil is
+            let veth: (string, string)? = network::create_veth_pair(pid, conv::str_to_int(str_last_octet(allocated)))
+            if veth != nil is
+                ip_address = veth.0
+                veth_host = veth.1
+                network::setup_port_forwarding(opts.ports, ip_address)
+            end
+        end
+    end
+
+    let row: db::ContainerRow = db::ContainerRow {
+        id: container_id, name: opts.name, image: opts.image_ref, pid: pid,
+        status: "Running", ip_address: ip_address, veth_host: veth_host,
+        bundle_path: bundle_path, ports_json: json::stringify_string_array(opts.ports),
+        pod_id: opts.pod_id, auto_restart: opts.auto_restart,
+        config_json: config::config_to_json(cfg), created_at: time::now_rfc3339()
+    }
+    db::insert_container(row)
+    log::info("Container '" + opts.name + "' created (" + container_id + "), pid=" + to_string(pid))
+    return (container_id, nil)
+end
+
+fn str_last_octet(ip: string) -> string is
+    let parts: [string] = str::split(ip, ".")
+    return parts[array_len(parts) - 1]
+end
+
+;; Fork + unshare + exec — mirrors the Rust version's use of
+;; `nix::unistd::fork` followed by `nix::sched::unshare` in the child.
+fn spawn_sandboxed(container_id: string, bundle_path: string, opts: CreateOptions, cfg: config::HkConfig) -> int? is
+    let child_pid: int = sys_ffi::fork_raw()
+    if child_pid < 0 is return nil end
+
+    if child_pid == 0 is
+        ;; ── child process ──
+        if !sandbox::unshare_namespaces(opts.rootless) is sys_ffi::kill_raw(sys_ffi::current_pid(), 9) end
+
+        let spec: sandbox::SandboxSpec = sandbox::SandboxSpec {
+            bundle_path: bundle_path,
+            memory_limit: if opts.memory_limit != "" then utils::parse_bytes(opts.memory_limit) else 0,
+            cpu_percent: opts.cpu_percent,
+            readonly_root: opts.readonly_root,
+            drop_caps: config::cfg_drop_caps(cfg),
+            rootless: opts.rootless,
+            seccomp_profile: opts.seccomp,
+            hostname: opts.name
+        }
+        sandbox::enter(container_id, sys_ffi::current_pid(), spec)
+
+        let cfg_cmd: [string] = config::cfg_cmd(cfg)
+        let argv: [string] = if array_len(cfg_cmd) > 0 then cfg_cmd else ["/bin/sh"]
+        sys_ffi::execve_raw(argv[0], str_join_space(argv), str_join_space(opts.env))
+        sys_ffi::kill_raw(sys_ffi::current_pid(), 9) ;; exec failed — die instead of falling through
+        return nil ;; unreachable
+    end
+
+    ;; ── parent process ──
+    return child_pid
+end
+
+fn str_join_space(items: [string]) -> string is
+    let mut out: string = ""
+    let mut first: bool = true
+    for i in items is
+        if !first is out += " " end
+        out += i
+        first = false
+    end
+    return out
+end
+
+pub fn stop_container(id_or_name: string, timeout_ms: int) -> OpError? is
+    let row: db::ContainerRow? = db::find_container(id_or_name)
+    if row == nil is return op_err("No such container: " + id_or_name) end
+    let c: db::ContainerRow = row
+    let c_pid: int = db::row_pid(c)
+    let c_id: string = db::row_id(c)
+    let c_name: string = db::row_name(c)
+    let c_ip: string = db::row_ip_address(c)
+    let c_pod_id: string = db::row_pod_id(c)
+
+    sys_ffi::signal_process(c_pid, sys_ffi::SIGTERM)
+
+    ;; [FIXED] adaptive polling instead of a fixed 5s sleep — see doc comment.
+    let grace: int = if timeout_ms > 0 then timeout_ms else GRACE_PERIOD_MS
+    let mut waited: int = 0
+    let mut exited: bool = false
+    while waited < grace is
+        if sys_ffi::try_reap(c_pid) is
+            exited = true
+            break
+        end
+        time::sleep_ms(POLL_INTERVAL_MS)
+        waited += POLL_INTERVAL_MS
+    end
+
+    if !exited is
+        sys_ffi::signal_process(c_pid, sys_ffi::SIGKILL)
+        sys_ffi::blocking_wait(c_pid)
+    end
+
+    if c_ip != "" is
+        network::cleanup_port_forwarding(row_ports(c), c_ip)
+    end
+    if c_pod_id == "" is
+        sandbox::destroy_cgroup(c_id)
+    end
+
+    db::update_container_status(c_id, "Stopped")
+    log::info("Container '" + c_name + "' stopped")
+    return nil
+end
+
+fn row_ports(c: db::ContainerRow) -> [string] is
+    return db::row_ports(c)
+end
+
+pub fn remove_container(id_or_name: string, force: bool) -> OpError? is
+    let row: db::ContainerRow? = db::find_container(id_or_name)
+    if row == nil is return op_err("No such container: " + id_or_name) end
+    let c: db::ContainerRow = row
+    let c_id: string = db::row_id(c)
+    let c_name: string = db::row_name(c)
+    let c_ip: string = db::row_ip_address(c)
+
+    if db::row_status(c) == "Running" is
+        if !force is return op_err("Container '" + c_name + "' is running; use --force to remove") end
+        stop_container(id_or_name, GRACE_PERIOD_MS)
+    end
+
+    image::destroy_bundle(c_id)
+    if c_ip != "" is db::ipam_release(c_id) end
+    logging::clear(logging::open_logger(LOG_ROOT, c_name))
+    db::delete_container(c_id)
+    log::info("Container '" + c_name + "' removed")
+    return nil
+end
+
+;; [EXPANDED] see module doc comment.
+pub fn restart_container(id_or_name: string) -> OpError? is
+    let row: db::ContainerRow? = db::find_container(id_or_name)
+    if row == nil is return op_err("No such container: " + id_or_name) end
+    let c: db::ContainerRow = row
+    let c_id: string = db::row_id(c)
+    let c_name: string = db::row_name(c)
+    let c_image: string = db::row_image(c)
+    let c_pod_id: string = db::row_pod_id(c)
+    let c_auto_restart: bool = db::row_auto_restart(c)
+
+    if db::row_status(c) == "Running" is
+        let stop_result: OpError? = stop_container(id_or_name, GRACE_PERIOD_MS)
+        if stop_result != nil is return stop_result end
+    end
+
+    let cfg: config::HkConfig? = config::config_from_json(db::row_config_json(c))
+    if cfg == nil is return op_err("Stored config for '" + c_name + "' is corrupt, cannot restart") end
+
+    let opts: CreateOptions = CreateOptions {
+        name: c_name, image_ref: c_image, mounts: config::cfg_mounts(cfg), ports: config::cfg_port_mappings(cfg),
+        env: config::cfg_env(cfg), memory_limit: config::cfg_memory_limit(cfg), cpu_percent: config::cfg_cpu_percent(cfg),
+        cni_network: config::cfg_cni_network(cfg), rootless: config::cfg_rootless(cfg),
+        readonly_root: config::cfg_readonly_root(cfg), auto_restart: c_auto_restart,
+        seccomp: config::cfg_seccomp_profile(cfg), pod_id: c_pod_id
+    }
+    db::delete_container(c_id)
+    let created: (string, OpError?) = create_container(opts)
+    return created.1
+end
+
+pub fn list_containers(page: int, per_page: int) -> ([db::ContainerRow], int) is
+    return db::list_containers_paged(page, per_page)
+end
+
+pub fn inspect_container(id_or_name: string) -> db::ContainerRow? is
+    return db::find_container(id_or_name)
+end
+
+pub fn container_stats(id_or_name: string) -> metrics::ContainerStats? is
+    let row: db::ContainerRow? = db::find_container(id_or_name)
+    if row == nil is return nil end
+    return metrics::collect_stats(db::row_id(row), db::row_pid(row))
+end
+
+pub fn container_logs(id_or_name: string, lines: int) -> [string]? is
+    let row: db::ContainerRow? = db::find_container(id_or_name)
+    if row == nil is return nil end
+    return logging::tail(logging::open_logger(LOG_ROOT, db::row_name(row)), lines)
+end
