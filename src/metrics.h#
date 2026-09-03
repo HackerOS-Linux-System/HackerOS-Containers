@@ -1,0 +1,118 @@
+use "std -> fs" from "fs"
+use "std -> strings" from "str"
+use "std -> time" from "time"
+
+pub struct ContainerStats is
+    pub memory_bytes:      int
+    pub memory_limit:      int
+    pub cpu_percent:       float
+    pub pids:              int
+    pub net_rx_bytes:      int
+    pub net_tx_bytes:      int
+end
+
+;; [FIXED] `memory_limit` and `cpu_percent` collide with field names on
+;; `Specs`, `CreateOptions` and `SandboxSpec` (different modules); `pids`
+;; is unique but included for consistency. Same-module accessors, same
+;; reasoning as db.h#'s row_* functions.
+pub fn stats_memory_bytes(s: ContainerStats) -> int is return s.memory_bytes end
+pub fn stats_memory_limit(s: ContainerStats) -> int is return s.memory_limit end
+pub fn stats_cpu_percent(s: ContainerStats) -> float is return s.cpu_percent end
+pub fn stats_pids(s: ContainerStats) -> int is return s.pids end
+pub fn stats_net_rx_bytes(s: ContainerStats) -> int is return s.net_rx_bytes end
+pub fn stats_net_tx_bytes(s: ContainerStats) -> int is return s.net_tx_bytes end
+
+fn cgroup_path(container_id: string) -> string is
+    return "/sys/fs/cgroup/hco/" + container_id
+end
+
+fn read_int_file(path: string) -> int is
+    if !fs::exists(path) is return 0 end
+    let content: string = str::trim(fs::read(path))
+    if content == "max" is return -1 end
+    return conv::str_to_int(content)
+end
+
+fn read_cpu_usage_usec(container_id: string) -> int is
+    let stat_path: string = cgroup_path(container_id) + "/cpu.stat"
+    if !fs::exists(stat_path) is return 0 end
+    for line in str::split(fs::read(stat_path), "\n") is
+        if str::starts_with(line, "usage_usec") is
+            return conv::str_to_int(str::trim(str::slice(line, 10, str::len(line))))
+        end
+    end
+    return 0
+end
+
+;; [FIXED] two-sample delta measurement — see module doc comment.
+fn read_cpu_percent(container_id: string, sample_ms: int) -> float is
+    let usage_before: int = read_cpu_usage_usec(container_id)
+    let t_before: int = time::now_millis()
+    time::sleep_ms(sample_ms)
+    let usage_after: int = read_cpu_usage_usec(container_id)
+    let t_after: int = time::now_millis()
+
+    let wall_usec: int = (t_after - t_before) * 1000
+    if wall_usec <= 0 is return 0.0 end
+    let delta_usec: int = usage_after - usage_before
+    return (int_to_float(delta_usec) / int_to_float(wall_usec)) * 100.0
+end
+
+fn read_net_bytes(container_id: string) -> (int, int) is
+    let veth: string = "veth" + container_id
+    let rx_path: string = "/sys/class/net/" + veth + "/statistics/rx_bytes"
+    let tx_path: string = "/sys/class/net/" + veth + "/statistics/tx_bytes"
+    return (read_int_file(rx_path), read_int_file(tx_path))
+end
+
+pub fn collect_stats(container_id: string, pid: int) -> ContainerStats is
+    let base: string = cgroup_path(container_id)
+    let memory_bytes: int = read_int_file(base + "/memory.current")
+    let memory_limit: int = read_int_file(base + "/memory.max")
+    let pids: int = read_int_file(base + "/pids.current")
+    let cpu_percent: float = read_cpu_percent(container_id, 100)
+    let net: (int, int) = read_net_bytes(container_id)
+
+    return ContainerStats {
+        memory_bytes: memory_bytes,
+        memory_limit: memory_limit,
+        cpu_percent: cpu_percent,
+        pids: pids,
+        net_rx_bytes: net.0,
+        net_tx_bytes: net.1
+    }
+end
+
+;; [EXPANDED] the Rust version only ever rendered stats for a single
+;; container at a time via the API; this adds a whole-fleet Prometheus
+;; `/metrics` exporter (used by api.h#'s new `/metrics` route) so hco can
+;; be scraped directly instead of needing a cAdvisor-style sidecar.
+pub fn render_prometheus(containers: [(string, string, ContainerStats)]) -> string is
+    let mut out: string = ""
+    out += "# HELP hco_container_memory_bytes Current memory usage in bytes\n"
+    out += "# TYPE hco_container_memory_bytes gauge\n"
+    for c in containers is
+        out += "hco_container_memory_bytes{id=\"" + c.0 + "\",name=\"" + c.1 + "\"} " + to_string(c.2.memory_bytes) + "\n"
+    end
+    out += "# HELP hco_container_cpu_percent Instantaneous CPU usage percentage\n"
+    out += "# TYPE hco_container_cpu_percent gauge\n"
+    for c in containers is
+        out += "hco_container_cpu_percent{id=\"" + c.0 + "\",name=\"" + c.1 + "\"} " + float_to_string(c.2.cpu_percent) + "\n"
+    end
+    out += "# HELP hco_container_pids Number of processes/threads in the container\n"
+    out += "# TYPE hco_container_pids gauge\n"
+    for c in containers is
+        out += "hco_container_pids{id=\"" + c.0 + "\",name=\"" + c.1 + "\"} " + to_string(c.2.pids) + "\n"
+    end
+    out += "# HELP hco_container_net_rx_bytes Bytes received on the container's veth\n"
+    out += "# TYPE hco_container_net_rx_bytes counter\n"
+    for c in containers is
+        out += "hco_container_net_rx_bytes{id=\"" + c.0 + "\",name=\"" + c.1 + "\"} " + to_string(c.2.net_rx_bytes) + "\n"
+    end
+    out += "# HELP hco_container_net_tx_bytes Bytes sent on the container's veth\n"
+    out += "# TYPE hco_container_net_tx_bytes counter\n"
+    for c in containers is
+        out += "hco_container_net_tx_bytes{id=\"" + c.0 + "\",name=\"" + c.1 + "\"} " + to_string(c.2.net_tx_bytes) + "\n"
+    end
+    return out
+end
