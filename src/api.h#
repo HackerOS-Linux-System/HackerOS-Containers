@@ -1,0 +1,271 @@
+use "std -> net_http" from "http"
+use "std -> json" from "json"
+use "std -> log" from "log"
+use "std -> env" from "env"
+use "std -> strings" from "str"
+
+mod container
+mod pod
+mod db
+mod metrics
+mod tls
+
+fn json_response(res: http::Response, status: int, body: any) is
+    http::set_status(res, status)
+    http::set_header(res, "Content-Type", "application/json")
+    http::write_body(res, json::stringify(body))
+end
+
+fn error_response(res: http::Response, status: int, message: string) is
+    let mut body: any = json::object()
+    json::set(body, "error", message)
+    json_response(res, status, body)
+end
+
+fn container_to_json(c: db::ContainerRow) -> any is
+    let mut body: any = json::object()
+    json::set(body, "id", db::row_id(c))
+    json::set(body, "name", db::row_name(c))
+    json::set(body, "image", db::row_image(c))
+    json::set(body, "pid", db::row_pid(c))
+    json::set(body, "status", db::row_status(c))
+    json::set(body, "ip_address", db::row_ip_address(c))
+    json::set(body, "ports", db::row_ports(c))
+    json::set(body, "pod_id", db::row_pod_id(c))
+    json::set(body, "created_at", db::row_created_at(c))
+    return body
+end
+
+fn pod_to_json(p: db::PodRow) -> any is
+    let mut body: any = json::object()
+    json::set(body, "name", db::pod_row_name(p))
+    json::set(body, "container_ids", db::pod_container_ids(p))
+    json::set(body, "status", db::pod_row_status(p))
+    json::set(body, "shared_network", db::pod_row_shared_network(p))
+    json::set(body, "created_at", db::pod_row_created_at(p))
+    return body
+end
+
+;; ── handlers ──────────────────────────────────────────────────────────────────
+
+fn handle_list_containers(req: http::Request, res: http::Response) is
+    let page: int = http::query_int(req, "page", 1)
+    let per_page: int = http::query_int(req, "per_page", 50)
+    let result: ([db::ContainerRow], int) = container::list_containers(page, per_page)
+    let mut items: [any] = []
+    for c in result.0 is
+        items = array_push(items, container_to_json(c))
+    end
+    let mut body: any = json::object()
+    json::set(body, "items", items)
+    json::set(body, "total", result.1)
+    json::set(body, "page", page)
+    json_response(res, 200, body)
+end
+
+fn handle_create_container(req: http::Request, res: http::Response) is
+    let parsed: any? = json::parse(http::body_text(req))
+    if parsed == nil is
+        error_response(res, 400, "Invalid JSON body")
+        return
+    end
+    let b: any = parsed
+    let opts: container::CreateOptions = container::CreateOptions {
+        name: json::get_string(b, "name", ""),
+        image_ref: json::get_string(b, "image", ""),
+        mounts: json::get_string_array(b, "mounts"),
+        ports: json::get_string_array(b, "ports"),
+        env: json::get_string_array(b, "env"),
+        memory_limit: json::get_string(b, "memory_limit", ""),
+        cpu_percent: json::get_int(b, "cpu_percent", 0),
+        cni_network: json::get_string(b, "cni_network", ""),
+        rootless: json::get_bool(b, "rootless", false),
+        readonly_root: json::get_bool(b, "readonly_root", false),
+        auto_restart: json::get_bool(b, "auto_restart", false),
+        seccomp: json::get_string(b, "seccomp_profile", ""),
+        pod_id: json::get_string(b, "pod_id", "")
+    }
+    let result: (string, container::OpError?) = container::create_container(opts)
+    if result.1 != nil is
+        error_response(res, 400, container::op_error_message(result.1))
+        return
+    end
+    let mut body: any = json::object()
+    json::set(body, "id", result.0)
+    json_response(res, 201, body)
+end
+
+fn handle_get_container(req: http::Request, res: http::Response) is
+    let id: string = http::path_param(req, "id")
+    let row: db::ContainerRow? = container::inspect_container(id)
+    if row == nil is
+        error_response(res, 404, "No such container: " + id)
+        return
+    end
+    json_response(res, 200, container_to_json(row))
+end
+
+fn handle_stop_container(req: http::Request, res: http::Response) is
+    let id: string = http::path_param(req, "id")
+    let result: container::OpError? = container::stop_container(id, 5000)
+    if result != nil is
+        error_response(res, 400, container::op_error_message(result))
+        return
+    end
+    http::set_status(res, 204)
+end
+
+fn handle_restart_container(req: http::Request, res: http::Response) is
+    let id: string = http::path_param(req, "id")
+    let result: container::OpError? = container::restart_container(id)
+    if result != nil is
+        error_response(res, 400, container::op_error_message(result))
+        return
+    end
+    http::set_status(res, 204)
+end
+
+fn handle_delete_container(req: http::Request, res: http::Response) is
+    let id: string = http::path_param(req, "id")
+    let force: bool = http::query_bool(req, "force", false)
+    let result: container::OpError? = container::remove_container(id, force)
+    if result != nil is
+        error_response(res, 400, container::op_error_message(result))
+        return
+    end
+    http::set_status(res, 204)
+end
+
+fn handle_container_stats(req: http::Request, res: http::Response) is
+    let id: string = http::path_param(req, "id")
+    let stats: metrics::ContainerStats? = container::container_stats(id)
+    if stats == nil is
+        error_response(res, 404, "No such container: " + id)
+        return
+    end
+    let s: metrics::ContainerStats = stats
+    let mut body: any = json::object()
+    json::set(body, "memory_bytes", metrics::stats_memory_bytes(s))
+    json::set(body, "memory_limit", metrics::stats_memory_limit(s))
+    json::set(body, "cpu_percent", metrics::stats_cpu_percent(s))
+    json::set(body, "pids", metrics::stats_pids(s))
+    json::set(body, "net_rx_bytes", metrics::stats_net_rx_bytes(s))
+    json::set(body, "net_tx_bytes", metrics::stats_net_tx_bytes(s))
+    json_response(res, 200, body)
+end
+
+fn handle_container_logs(req: http::Request, res: http::Response) is
+    let id: string = http::path_param(req, "id")
+    let lines: int = http::query_int(req, "lines", 100)
+    let logs: [string]? = container::container_logs(id, lines)
+    if logs == nil is
+        error_response(res, 404, "No such container: " + id)
+        return
+    end
+    http::set_status(res, 200)
+    http::set_header(res, "Content-Type", "text/plain")
+    http::write_body(res, str::join(logs, "\n"))
+end
+
+fn handle_list_pods(req: http::Request, res: http::Response) is
+    let page: int = http::query_int(req, "page", 1)
+    let per_page: int = http::query_int(req, "per_page", 50)
+    let result: ([db::PodRow], int) = pod::list_pods(page, per_page)
+    let mut items: [any] = []
+    for p in result.0 is
+        items = array_push(items, pod_to_json(p))
+    end
+    let mut body: any = json::object()
+    json::set(body, "items", items)
+    json::set(body, "total", result.1)
+    json_response(res, 200, body)
+end
+
+fn handle_create_pod(req: http::Request, res: http::Response) is
+    let parsed: any? = json::parse(http::body_text(req))
+    if parsed == nil is
+        error_response(res, 400, "Invalid JSON body")
+        return
+    end
+    let b: any = parsed
+    let opts: pod::PodCreateOptions = pod::PodCreateOptions {
+        name: json::get_string(b, "name", ""),
+        shared_network: json::get_bool(b, "shared_network", true),
+        shared_pid: json::get_bool(b, "shared_pid", true),
+        shared_ipc: json::get_bool(b, "shared_ipc", true),
+        cni_network: json::get_string(b, "cni_network", "")
+    }
+    let result: (string, pod::OpError?) = pod::create_pod(opts)
+    if result.1 != nil is
+        error_response(res, 400, pod::op_error_message(result.1))
+        return
+    end
+    let mut body: any = json::object()
+    json::set(body, "name", result.0)
+    json_response(res, 201, body)
+end
+
+fn handle_delete_pod(req: http::Request, res: http::Response) is
+    let name: string = http::path_param(req, "name")
+    let force: bool = http::query_bool(req, "force", false)
+    let result: pod::OpError? = pod::remove_pod(name, force)
+    if result != nil is
+        error_response(res, 400, pod::op_error_message(result))
+        return
+    end
+    http::set_status(res, 204)
+end
+
+;; [EXPANDED] see module doc comment.
+fn handle_healthz(req: http::Request, res: http::Response) is
+    http::set_status(res, 200)
+    http::write_body(res, "ok")
+end
+
+fn handle_metrics(req: http::Request, res: http::Response) is
+    let result: ([db::ContainerRow], int) = container::list_containers(1, 10000)
+    let mut samples: [(string, string, metrics::ContainerStats)] = []
+    for c in result.0 is
+        if db::row_status(c) == "Running" is
+            samples = array_push(samples, (db::row_id(c), db::row_name(c), metrics::collect_stats(db::row_id(c), db::row_pid(c))))
+        end
+    end
+    http::set_status(res, 200)
+    http::set_header(res, "Content-Type", "text/plain; version=0.0.4")
+    http::write_body(res, metrics::render_prometheus(samples))
+end
+
+;; ── routing / bootstrap ───────────────────────────────────────────────────────
+
+pub fn run_server(bind_addr: string, cert_path: string, key_path: string, socket_activated: bool) is
+    let mut router: http::Router = http::new_router()
+
+    http::get(router, "/healthz", handle_healthz)
+    http::get(router, "/metrics", handle_metrics)
+
+    http::get(router, "/containers", handle_list_containers)
+    http::post(router, "/containers", handle_create_container)
+    http::get(router, "/containers/:id", handle_get_container)
+    http::post(router, "/containers/:id/stop", handle_stop_container)
+    http::post(router, "/containers/:id/restart", handle_restart_container)
+    http::delete(router, "/containers/:id", handle_delete_container)
+    http::get(router, "/containers/:id/stats", handle_container_stats)
+    http::get(router, "/containers/:id/logs", handle_container_logs)
+
+    http::get(router, "/pods", handle_list_pods)
+    http::post(router, "/pods", handle_create_pod)
+    http::delete(router, "/pods/:name", handle_delete_pod)
+
+    if tls::tls_files_present(cert_path, key_path) is
+        let tls_cfg: any? = tls::build_server_config(cert_path, key_path)
+        if tls_cfg != nil is
+            log::info("hco API listening on https://" + bind_addr)
+            http::serve_tls(router, bind_addr, tls_cfg, socket_activated)
+            return
+        end
+        log::warn("TLS requested but cert/key could not be loaded; falling back to HTTP")
+    end
+
+    log::info("hco API listening on http://" + bind_addr)
+    http::serve(router, bind_addr, socket_activated)
+end
