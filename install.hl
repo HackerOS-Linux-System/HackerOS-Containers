@@ -1,3 +1,4 @@
 // curl
 
->
+^> curl -L "https://github.com/HackerOS-Linux-System/HackerOS-Containers/releases/download/v0.4/hco" -o /usr/bin/hco
+^> chmod a+x /usr/bin/hco
