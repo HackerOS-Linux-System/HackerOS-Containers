@@ -1,0 +1,72 @@
+use "std -> fs" from "fs"
+use "std -> path" from "path"
+use "std -> log" from "log"
+use "std -> time" from "time"
+use "std -> strings" from "str"
+
+const MAX_LOG_BYTES: int = 10 * 1024 * 1024 ;; 10 MB
+const MAX_ROTATED:   int = 3
+
+pub struct ContainerLogger is
+    pub log_dir: string
+    pub name:    string
+end
+
+pub fn open_logger(log_root: string, container_name: string) -> ContainerLogger is
+    let dir: string = log_root + "/" + container_name
+    if !fs::exists(dir) is fs::mkdir_all(dir) end
+    return ContainerLogger { log_dir: dir, name: container_name }
+end
+
+fn active_log_path(logger: ContainerLogger) -> string is
+    return logger.log_dir + "/current.log"
+end
+
+fn rotated_log_path(logger: ContainerLogger, n: int) -> string is
+    return logger.log_dir + "/rotated." + to_string(n) + ".log"
+end
+
+fn rotate_if_needed(logger: ContainerLogger) is
+    let active: string = active_log_path(logger)
+    if !fs::exists(active) is return end
+    if fs::file_size(active) < MAX_LOG_BYTES is return end
+
+    ;; [FIXED] shift older generations up before rotating the active file
+    ;; in, instead of clobbering rotated.1.log every time.
+    let mut n: int = MAX_ROTATED
+    while n >= 1 is
+        let src: string = rotated_log_path(logger, n)
+        if fs::exists(src) is
+            if n == MAX_ROTATED is
+                fs::remove(src)
+            else is
+                fs::rename(src, rotated_log_path(logger, n + 1))
+            end
+        end
+        n -= 1
+    end
+    fs::rename(active, rotated_log_path(logger, 1))
+    log::info("Rotated log for container " + logger.name)
+end
+
+pub fn append_line(logger: ContainerLogger, stream: string, line: string) is
+    rotate_if_needed(logger)
+    let timestamp: string = time::now_rfc3339()
+    let entry: string = "[" + timestamp + "] [" + stream + "] " + line + "\n"
+    fs::append(active_log_path(logger), entry)
+end
+
+pub fn tail(logger: ContainerLogger, lines: int) -> [string] is
+    let active: string = active_log_path(logger)
+    if !fs::exists(active) is return [] end
+    let content: string = fs::read(active)
+    let all_lines: [string] = str::split(content, "\n")
+    let total: int = array_len(all_lines)
+    if total <= lines is return all_lines end
+    return array_slice(all_lines, total - lines, total)
+end
+
+pub fn clear(logger: ContainerLogger) is
+    let dir: string = logger.log_dir
+    if fs::exists(dir) is fs::remove_all(dir) end
+end
