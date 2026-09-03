@@ -14,14 +14,16 @@ NotifyAccess=main
 User=root
 Group=root
 
-ExecStartPre=/usr/local/bin/hco list
-ExecStart=/usr/local/bin/hco api \
-    --api-addr ${HCO_API_ADDR:-0.0.0.0:8080} \
-    ${HCO_API_TOKEN:+--api-token} ${HCO_API_TOKEN} \
+ExecStartPre=/usr/local/bin/hco ls
+# NOTE: [FIXED] the H# port's CLI uses `hco serve --bind ... --tls-cert
+# ... --tls-key ...` (see main.h#) instead of the old Rust binary's
+# `hco api --api-addr ...`; the previous unit file still referenced the
+# retired flag names and would have failed to start against this build.
+ExecStart=/usr/local/bin/hco serve \
+    --bind ${HCO_API_ADDR:-0.0.0.0:7443} \
     ${HCO_TLS_CERT:+--tls-cert} ${HCO_TLS_CERT} \
     ${HCO_TLS_KEY:+--tls-key}  ${HCO_TLS_KEY} \
-    ${HCO_OTLP:+--otlp} ${HCO_OTLP} \
-    --json-logs
+    --systemd-socket
 
 EnvironmentFile=-/etc/hco/hco.env
 
