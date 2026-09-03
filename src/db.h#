@@ -1,0 +1,294 @@
+use "std -> sqlite" from "sqlite"
+use "std -> json" from "json"
+use "std -> time" from "t"
+use "std -> fs" from "fs"
+use "std -> log" from "log"
+
+const SCHEMA_VERSION: int = 1
+
+let mut db_handle: any = nil
+
+pub fn init_db(path: string) -> bool is
+    let handle: any? = sqlite::open(path)
+    if handle == nil is
+        log::error("Cannot open state DB at " + path)
+        return false
+    end
+    db_handle = handle
+    sqlite::exec(db_handle, "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")
+    run_migrations()
+    return true
+end
+
+fn run_migrations() is
+    sqlite::exec(db_handle, "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);")
+    let version: int = sqlite::query_scalar_int(db_handle, "SELECT version FROM schema_version LIMIT 1", 0)
+    if version < SCHEMA_VERSION is
+        let schema_path: string = path_join_module_dir("schema.sql")
+        let schema_sql: string = if fs::exists(schema_path) then fs::read(schema_path) else EMBEDDED_SCHEMA
+        sqlite::exec(db_handle, schema_sql)
+        sqlite::exec(db_handle, "DELETE FROM schema_version")
+        sqlite::exec_params(db_handle, "INSERT INTO schema_version VALUES (?1)", [SCHEMA_VERSION])
+        log::info("DB schema migrated to v" + to_string(SCHEMA_VERSION))
+    end
+end
+
+;; Fallback copy of schema.sql, kept in sync with the file on disk, used
+;; only if the on-disk file cannot be located (e.g. a stripped release
+;; install where only the compiled binary shipped). Mirrors the safety
+;; net that `include_str` gave the Rust build at compile time.
+const EMBEDDED_SCHEMA: string =
+    "CREATE TABLE IF NOT EXISTS containers (" +
+    " id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, image TEXT NOT NULL DEFAULT 'unknown'," +
+    " pid INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'Running', ip_address TEXT, veth_host TEXT," +
+    " bundle_path TEXT NOT NULL DEFAULT '', ports_json TEXT NOT NULL DEFAULT '[]', pod_id TEXT," +
+    " auto_restart INTEGER NOT NULL DEFAULT 0, config_json TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL);" +
+    "CREATE INDEX IF NOT EXISTS idx_containers_name ON containers(name);" +
+    "CREATE INDEX IF NOT EXISTS idx_containers_status ON containers(status);" +
+    "CREATE TABLE IF NOT EXISTS pods (" +
+    " name TEXT PRIMARY KEY, container_ids_json TEXT NOT NULL DEFAULT '[]', status TEXT NOT NULL DEFAULT 'Running'," +
+    " shared_network INTEGER NOT NULL DEFAULT 1, shared_pid INTEGER NOT NULL DEFAULT 1, shared_ipc INTEGER NOT NULL DEFAULT 1," +
+    " netns_path TEXT, spec_json TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL);" +
+    "CREATE TABLE IF NOT EXISTS ipam (" +
+    " container_id TEXT PRIMARY KEY, suffix INTEGER NOT NULL UNIQUE," +
+    " subnet_prefix TEXT NOT NULL DEFAULT '10.10.0', released INTEGER NOT NULL DEFAULT 0);" +
+    "CREATE INDEX IF NOT EXISTS idx_ipam_released ON ipam(released);"
+
+fn path_join_module_dir(name: string) -> string is
+    return env::exe_dir() + "/" + name
+end
+
+;; ── Container row ─────────────────────────────────────────────────────────────
+
+pub struct ContainerRow is
+    pub id:            string
+    pub name:          string
+    pub image:         string
+    pub pid:           int
+    pub status:        string
+    pub ip_address:    string ;; "" == None
+    pub veth_host:     string ;; "" == None
+    pub bundle_path:   string
+    pub ports_json:    string
+    pub pod_id:        string ;; "" == None
+    pub auto_restart:  bool
+    pub config_json:   string
+    pub created_at:    string ;; RFC3339
+end
+
+pub fn row_ports(row: ContainerRow) -> [string] is
+    return json::get_string_array(json::parse(row.ports_json), "")
+end
+
+;; [FIXED] Every field of `ContainerRow` below is read from container.h#,
+;; api.h# and main.h# — files other than this one. `id`, `name`,
+;; `status`, `created_at`, `pod_id` and others here collide with field
+;; names on *other* structs defined elsewhere (`PodRow`, `Metadata`,
+;; `CreateOptions`, `ContainerLogger`, ...). The h# v0.8 compiler cannot
+;; statically resolve a struct field accessed outside the file that
+;; defines the struct when the field name isn't unique across all known
+;; structs — it "guesses by scanning", and picks the wrong struct's
+;; layout when there's a genuine name collision (this is the exact bug
+;; documented and fixed in `bytes` itself, see `bytes-main`'s
+;; `BYTES_FIX_NOTES.md` for the reproduction). Same-module accessor
+;; functions are the proven-safe workaround, so every field that's read
+;; from outside this file gets one here instead of a raw `.field` chain
+;; at the call site.
+pub fn row_id(r: ContainerRow) -> string is return r.id end
+pub fn row_name(r: ContainerRow) -> string is return r.name end
+pub fn row_image(r: ContainerRow) -> string is return r.image end
+pub fn row_pid(r: ContainerRow) -> int is return r.pid end
+pub fn row_status(r: ContainerRow) -> string is return r.status end
+pub fn row_ip_address(r: ContainerRow) -> string is return r.ip_address end
+pub fn row_veth_host(r: ContainerRow) -> string is return r.veth_host end
+pub fn row_bundle_path(r: ContainerRow) -> string is return r.bundle_path end
+pub fn row_pod_id(r: ContainerRow) -> string is return r.pod_id end
+pub fn row_auto_restart(r: ContainerRow) -> bool is return r.auto_restart end
+pub fn row_config_json(r: ContainerRow) -> string is return r.config_json end
+pub fn row_created_at(r: ContainerRow) -> string is return r.created_at end
+
+pub fn insert_container(row: ContainerRow) -> bool is
+    return sqlite::exec_params(db_handle,
+        "INSERT INTO containers (id,name,image,pid,status,ip_address,veth_host,bundle_path,ports_json,pod_id,auto_restart,config_json,created_at) " +
+        "VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+        [row.id, row.name, row.image, row.pid, row.status, row.ip_address, row.veth_host,
+         row.bundle_path, row.ports_json, row.pod_id, bool_to_int(row.auto_restart), row.config_json, row.created_at])
+end
+
+pub fn update_container_status(id: string, status: string) -> bool is
+    return sqlite::exec_params(db_handle, "UPDATE containers SET status=?1 WHERE id=?2", [status, id])
+end
+
+pub fn delete_container(id: string) -> bool is
+    return sqlite::exec_params(db_handle, "DELETE FROM containers WHERE id=?1", [id])
+end
+
+pub fn find_container(prefix: string) -> ContainerRow? is
+    let pattern: string = prefix + "%"
+    let result: any? = sqlite::query_row_params(db_handle,
+        "SELECT id,name,image,pid,status,ip_address,veth_host,bundle_path,ports_json,pod_id,auto_restart,config_json,created_at " +
+        "FROM containers WHERE id LIKE ?1 OR name=?1 LIMIT 1", [pattern])
+    if result == nil is return nil end
+    return row_to_container(result)
+end
+
+pub fn list_containers_paged(page: int, per_page: int) -> ([ContainerRow], int) is
+    ;; [FIXED] both queries now run inside one transaction — see module doc.
+    sqlite::begin(db_handle)
+    let total: int = sqlite::query_scalar_int(db_handle, "SELECT COUNT(*) FROM containers", 0)
+    let offset: int = if page > 1 then (page - 1) * per_page else 0
+    let raw_rows: [any] = sqlite::query_all_params(db_handle,
+        "SELECT id,name,image,pid,status,ip_address,veth_host,bundle_path,ports_json,pod_id,auto_restart,config_json,created_at " +
+        "FROM containers LIMIT ?1 OFFSET ?2", [per_page, offset])
+    sqlite::commit(db_handle)
+
+    let mut rows: [ContainerRow] = []
+    for r in raw_rows is
+        rows = array_push(rows, row_to_container(r))
+    end
+    return (rows, total)
+end
+
+pub fn count_running_containers() -> int is
+    return sqlite::query_scalar_int(db_handle, "SELECT COUNT(*) FROM containers WHERE status='Running'", 0)
+end
+
+fn row_to_container(r: any) -> ContainerRow is
+    return ContainerRow {
+        id: sqlite::col_string(r, 0), name: sqlite::col_string(r, 1), image: sqlite::col_string(r, 2),
+        pid: sqlite::col_int(r, 3), status: sqlite::col_string(r, 4),
+        ip_address: sqlite::col_string(r, 5), veth_host: sqlite::col_string(r, 6),
+        bundle_path: sqlite::col_string(r, 7), ports_json: sqlite::col_string(r, 8),
+        pod_id: sqlite::col_string(r, 9), auto_restart: sqlite::col_int(r, 10) != 0,
+        config_json: sqlite::col_string(r, 11), created_at: sqlite::col_string(r, 12)
+    }
+end
+
+;; ── Pod row ───────────────────────────────────────────────────────────────────
+
+pub struct PodRow is
+    pub name:               string
+    pub container_ids_json: string
+    pub status:             string
+    pub shared_network:     bool
+    pub shared_pid:         bool
+    pub shared_ipc:         bool
+    pub netns_path:         string ;; "" == None
+    pub spec_json:          string
+    pub created_at:         string
+end
+
+pub fn pod_container_ids(row: PodRow) -> [string] is
+    let parsed: any? = json::parse(row.container_ids_json)
+    if parsed == nil is return [] end
+    return json::array_to_string_list(parsed)
+end
+
+;; [FIXED] same cross-module field-collision issue as ContainerRow above
+;; (`name`, `status`, `created_at` all collide with other structs).
+pub fn pod_row_name(r: PodRow) -> string is return r.name end
+pub fn pod_row_status(r: PodRow) -> string is return r.status end
+pub fn pod_row_shared_network(r: PodRow) -> bool is return r.shared_network end
+pub fn pod_row_shared_pid(r: PodRow) -> bool is return r.shared_pid end
+pub fn pod_row_shared_ipc(r: PodRow) -> bool is return r.shared_ipc end
+pub fn pod_row_netns_path(r: PodRow) -> string is return r.netns_path end
+pub fn pod_row_spec_json(r: PodRow) -> string is return r.spec_json end
+pub fn pod_row_created_at(r: PodRow) -> string is return r.created_at end
+pub fn pod_row_container_ids_json(r: PodRow) -> string is return r.container_ids_json end
+
+
+pub fn insert_pod(row: PodRow) -> bool is
+    return sqlite::exec_params(db_handle,
+        "INSERT INTO pods (name,container_ids_json,status,shared_network,shared_pid,shared_ipc,netns_path,spec_json,created_at) " +
+        "VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+        [row.name, row.container_ids_json, row.status, bool_to_int(row.shared_network),
+         bool_to_int(row.shared_pid), bool_to_int(row.shared_ipc), row.netns_path, row.spec_json, row.created_at])
+end
+
+pub fn delete_pod(name: string) -> bool is
+    return sqlite::exec_params(db_handle, "DELETE FROM pods WHERE name=?1", [name])
+end
+
+pub fn find_pod(name: string) -> PodRow? is
+    let result: any? = sqlite::query_row_params(db_handle,
+        "SELECT name,container_ids_json,status,shared_network,shared_pid,shared_ipc,netns_path,spec_json,created_at " +
+        "FROM pods WHERE name=?1", [name])
+    if result == nil is return nil end
+    return row_to_pod(result)
+end
+
+pub fn list_pods_paged(page: int, per_page: int) -> ([PodRow], int) is
+    sqlite::begin(db_handle)
+    let total: int = sqlite::query_scalar_int(db_handle, "SELECT COUNT(*) FROM pods", 0)
+    let offset: int = if page > 1 then (page - 1) * per_page else 0
+    let raw_rows: [any] = sqlite::query_all_params(db_handle,
+        "SELECT name,container_ids_json,status,shared_network,shared_pid,shared_ipc,netns_path,spec_json,created_at " +
+        "FROM pods LIMIT ?1 OFFSET ?2", [per_page, offset])
+    sqlite::commit(db_handle)
+
+    let mut rows: [PodRow] = []
+    for r in raw_rows is
+        rows = array_push(rows, row_to_pod(r))
+    end
+    return (rows, total)
+end
+
+fn row_to_pod(r: any) -> PodRow is
+    return PodRow {
+        name: sqlite::col_string(r, 0), container_ids_json: sqlite::col_string(r, 1),
+        status: sqlite::col_string(r, 2), shared_network: sqlite::col_int(r, 3) != 0,
+        shared_pid: sqlite::col_int(r, 4) != 0, shared_ipc: sqlite::col_int(r, 5) != 0,
+        netns_path: sqlite::col_string(r, 6), spec_json: sqlite::col_string(r, 7),
+        created_at: sqlite::col_string(r, 8)
+    }
+end
+
+;; ── IPAM ──────────────────────────────────────────────────────────────────────
+
+pub fn ipam_allocate(container_id: string, subnet_prefix: string) -> string? is
+    sqlite::begin(db_handle)
+    let used_rows: [any] = sqlite::query_all(db_handle, "SELECT suffix FROM ipam WHERE released=0")
+    let mut used: [int] = []
+    for r in used_rows is
+        used = array_push(used, sqlite::col_int(r, 0))
+    end
+
+    let mut suffix: int = -1
+    let mut candidate: int = 2
+    while candidate <= 254 is
+        if !array_contains_int(used, candidate) is
+            suffix = candidate
+            break
+        end
+        candidate += 1
+    end
+
+    if suffix < 0 is
+        sqlite::commit(db_handle)
+        return nil
+    end
+
+    sqlite::exec_params(db_handle,
+        "INSERT OR REPLACE INTO ipam (container_id, suffix, subnet_prefix, released) VALUES (?1, ?2, ?3, 0)",
+        [container_id, suffix, subnet_prefix])
+    sqlite::commit(db_handle)
+    return subnet_prefix + "." + to_string(suffix)
+end
+
+pub fn ipam_release(container_id: string) -> bool is
+    return sqlite::exec_params(db_handle, "UPDATE ipam SET released=1 WHERE container_id=?1", [container_id])
+end
+
+;; ── small helpers ─────────────────────────────────────────────────────────────
+
+fn bool_to_int(b: bool) -> int is
+    if b is return 1 end
+    return 0
+end
+
+fn array_contains_int(arr: [int], v: int) -> bool is
+    for x in arr is
+        if x == v is return true end
+    end
+    return false
+end
