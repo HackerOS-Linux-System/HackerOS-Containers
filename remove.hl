@@ -1,1 +1,6 @@
-> rm -rf /usr/bin/hco
+^> systemctl stop hco-api.socket hco-api.service
+^> systemctl disable hco-api.socket hco-api.service
+^> rm -f /etc/systemd/system/hco-api.service
+^> rm -f /etc/systemd/system/hco-api.socket
+^> systemctl daemon-reload
+^> rm -rf /usr/bin/hco
