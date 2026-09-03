@@ -1,0 +1,247 @@
+use "std -> cli" from "cli"
+use "std -> log" from "log"
+use "std -> env" from "env"
+use "std -> term" from "term"
+use "std -> json" from "json"
+use "std -> strings" from "str"
+
+mod db
+mod config
+mod container
+mod pod
+mod image
+mod network
+mod api
+mod validation
+mod metrics
+
+const DEFAULT_DB_PATH: string = "/var/lib/hco/state.db"
+const DEFAULT_BIND: string = "0.0.0.0:7443"
+const DEFAULT_LOG_DIR: string = "/var/log/hco"
+const HCO_VERSION_STRING: string = "hco 0.4.0 (H# port)"
+
+fn bootstrap() -> bool is
+    log::init(DEFAULT_LOG_DIR + "/hco.log")
+    if !db::init_db(env::var_or("HCO_DB_PATH", DEFAULT_DB_PATH)) is
+        term::eprintln("fatal: cannot initialize state database")
+        return false
+    end
+    return true
+end
+
+fn print_table(headers: [string], rows: [[string]]) is
+    term::println(str::join(headers, "\t"))
+    for r in rows is
+        term::println(str::join(r, "\t"))
+    end
+end
+
+fn cmd_create(args: cli::Args) is
+    let opts: container::CreateOptions = container::CreateOptions {
+        name: cli::arg(args, "name"),
+        image_ref: cli::arg(args, "image"),
+        mounts: cli::arg_list(args, "mount"),
+        ports: cli::arg_list(args, "port"),
+        env: cli::arg_list(args, "env"),
+        memory_limit: cli::arg_or(args, "memory", ""),
+        cpu_percent: cli::arg_int_or(args, "cpu", 0),
+        cni_network: cli::arg_or(args, "network", ""),
+        rootless: cli::flag(args, "rootless"),
+        readonly_root: cli::flag(args, "readonly"),
+        auto_restart: cli::flag(args, "auto-restart"),
+        seccomp: cli::arg_or(args, "seccomp", ""),
+        pod_id: cli::arg_or(args, "pod", "")
+    }
+    let result: (string, container::OpError?) = container::create_container(opts)
+    if result.1 != nil is
+        term::eprintln("error: " + container::op_error_message(result.1))
+        env::exit(1)
+    end
+    term::println(result.0)
+end
+
+fn cmd_start(args: cli::Args) is
+    ;; `hco start` on an already-created-but-stopped container is
+    ;; equivalent to a restart of a stopped container.
+    let id: string = cli::arg(args, "id")
+    let result: container::OpError? = container::restart_container(id)
+    if result != nil is
+        term::eprintln("error: " + container::op_error_message(result))
+        env::exit(1)
+    end
+end
+
+fn cmd_stop(args: cli::Args) is
+    let id: string = cli::arg(args, "id")
+    let timeout: int = cli::arg_int_or(args, "timeout", 5000)
+    let result: container::OpError? = container::stop_container(id, timeout)
+    if result != nil is
+        term::eprintln("error: " + container::op_error_message(result))
+        env::exit(1)
+    end
+end
+
+fn cmd_restart(args: cli::Args) is
+    let id: string = cli::arg(args, "id")
+    let result: container::OpError? = container::restart_container(id)
+    if result != nil is
+        term::eprintln("error: " + container::op_error_message(result))
+        env::exit(1)
+    end
+end
+
+fn cmd_rm(args: cli::Args) is
+    let id: string = cli::arg(args, "id")
+    let force: bool = cli::flag(args, "force")
+    let result: container::OpError? = container::remove_container(id, force)
+    if result != nil is
+        term::eprintln("error: " + container::op_error_message(result))
+        env::exit(1)
+    end
+end
+
+fn cmd_ls(args: cli::Args) is
+    let page: int = cli::arg_int_or(args, "page", 1)
+    let per_page: int = cli::arg_int_or(args, "per-page", 50)
+    let result: ([db::ContainerRow], int) = container::list_containers(page, per_page)
+
+    if cli::flag(args, "json") is
+        let mut items: [any] = []
+        for c in result.0 is
+            let mut o: any = json::object()
+            json::set(o, "id", db::row_id(c))
+            json::set(o, "name", db::row_name(c))
+            json::set(o, "image", db::row_image(c))
+            json::set(o, "status", db::row_status(c))
+            json::set(o, "ip_address", db::row_ip_address(c))
+            items = array_push(items, o)
+        end
+        term::println(json::stringify(items))
+        return
+    end
+
+    let mut rows: [[string]] = []
+    for c in result.0 is
+        rows = array_push(rows, [str::slice(db::row_id(c), 0, 12), db::row_name(c), db::row_image(c), db::row_status(c), db::row_ip_address(c)])
+    end
+    print_table(["ID", "NAME", "IMAGE", "STATUS", "IP"], rows)
+end
+
+fn cmd_inspect(args: cli::Args) is
+    let id: string = cli::arg(args, "id")
+    let row: db::ContainerRow? = container::inspect_container(id)
+    if row == nil is
+        term::eprintln("error: no such container: " + id)
+        env::exit(1)
+    end
+    term::println(config::config_to_json(config::config_from_json(db::row_config_json(row))))
+end
+
+fn cmd_logs(args: cli::Args) is
+    let id: string = cli::arg(args, "id")
+    let lines: int = cli::arg_int_or(args, "lines", 100)
+    let logs: [string]? = container::container_logs(id, lines)
+    if logs == nil is
+        term::eprintln("error: no such container: " + id)
+        env::exit(1)
+    end
+    for line in logs is
+        term::println(line)
+    end
+end
+
+fn cmd_stats(args: cli::Args) is
+    let id: string = cli::arg(args, "id")
+    let stats: metrics::ContainerStats? = container::container_stats(id)
+    if stats == nil is
+        term::eprintln("error: no such container: " + id)
+        env::exit(1)
+    end
+    let s: metrics::ContainerStats = stats
+    term::println("Memory: " + to_string(metrics::stats_memory_bytes(s)) + " / " + to_string(metrics::stats_memory_limit(s)) + " bytes")
+    term::println("CPU:    " + float_to_string(metrics::stats_cpu_percent(s)) + "%")
+    term::println("PIDs:   " + to_string(metrics::stats_pids(s)))
+    term::println("Net RX: " + to_string(metrics::stats_net_rx_bytes(s)) + " bytes, TX: " + to_string(metrics::stats_net_tx_bytes(s)) + " bytes")
+end
+
+fn cmd_pod_create(args: cli::Args) is
+    let opts: pod::PodCreateOptions = pod::PodCreateOptions {
+        name: cli::arg(args, "name"),
+        shared_network: !cli::flag(args, "no-shared-network"),
+        shared_pid: !cli::flag(args, "no-shared-pid"),
+        shared_ipc: !cli::flag(args, "no-shared-ipc"),
+        cni_network: cli::arg_or(args, "network", "")
+    }
+    let result: (string, pod::OpError?) = pod::create_pod(opts)
+    if result.1 != nil is
+        term::eprintln("error: " + pod::op_error_message(result.1))
+        env::exit(1)
+    end
+    term::println(result.0)
+end
+
+fn cmd_pod_ls(args: cli::Args) is
+    let result: ([db::PodRow], int) = pod::list_pods(1, 100)
+    let mut rows: [[string]] = []
+    for p in result.0 is
+        rows = array_push(rows, [db::pod_row_name(p), db::pod_row_status(p), to_string(array_len(db::pod_container_ids(p)))])
+    end
+    print_table(["NAME", "STATUS", "CONTAINERS"], rows)
+end
+
+fn cmd_pod_rm(args: cli::Args) is
+    let name: string = cli::arg(args, "name")
+    let force: bool = cli::flag(args, "force")
+    let result: pod::OpError? = pod::remove_pod(name, force)
+    if result != nil is
+        term::eprintln("error: " + pod::op_error_message(result))
+        env::exit(1)
+    end
+end
+
+;; [EXPANDED] see module doc comment.
+fn cmd_image_prune(args: cli::Args) is
+    let result: ([db::ContainerRow], int) = container::list_containers(1, 100000)
+    let mut referenced: [string] = []
+    for c in result.0 is
+        referenced = array_push(referenced, db::row_image(c))
+    end
+    let removed: int = image::prune_unused(referenced)
+    term::println("Removed " + to_string(removed) + " unused image(s)")
+end
+
+fn cmd_serve(args: cli::Args) is
+    let bind: string = cli::arg_or(args, "bind", DEFAULT_BIND)
+    let cert: string = cli::arg_or(args, "tls-cert", "")
+    let key: string = cli::arg_or(args, "tls-key", "")
+    let socket_activated: bool = cli::flag(args, "systemd-socket")
+    api::run_server(bind, cert, key, socket_activated)
+end
+
+fn build_cli() -> cli::App is
+    let mut app: cli::App = cli::new_app("hco", HCO_VERSION_STRING)
+
+    cli::subcommand(app, "create", cmd_create, ["name", "image"],
+        ["mount", "port", "env", "memory", "cpu", "network", "rootless", "readonly", "auto-restart", "seccomp", "pod"])
+    cli::subcommand(app, "start", cmd_start, ["id"], [])
+    cli::subcommand(app, "stop", cmd_stop, ["id"], ["timeout"])
+    cli::subcommand(app, "restart", cmd_restart, ["id"], [])
+    cli::subcommand(app, "rm", cmd_rm, ["id"], ["force"])
+    cli::subcommand(app, "ls", cmd_ls, [], ["page", "per-page", "json"])
+    cli::subcommand(app, "inspect", cmd_inspect, ["id"], [])
+    cli::subcommand(app, "logs", cmd_logs, ["id"], ["lines"])
+    cli::subcommand(app, "stats", cmd_stats, ["id"], [])
+    cli::subcommand(app, "pod-create", cmd_pod_create, ["name"], ["no-shared-network", "no-shared-pid", "no-shared-ipc", "network"])
+    cli::subcommand(app, "pod-ls", cmd_pod_ls, [], [])
+    cli::subcommand(app, "pod-rm", cmd_pod_rm, ["name"], ["force"])
+    cli::subcommand(app, "image-prune", cmd_image_prune, [], [])
+    cli::subcommand(app, "serve", cmd_serve, [], ["bind", "tls-cert", "tls-key", "systemd-socket"])
+
+    return app
+end
+
+fn main() is
+    if !bootstrap() is env::exit(1) end
+    let app: cli::App = build_cli()
+    cli::run(app, env::args())
+end
