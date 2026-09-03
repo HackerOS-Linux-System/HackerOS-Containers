@@ -1,0 +1,51 @@
+use "std -> process" from "proc"
+use "std -> fs" from "fs"
+use "std -> json" from "json"
+use "std -> strings" from "str"
+
+mod utils
+
+pub fn cni_add(network_name: string, container_id: string, netns_path: string) -> string? is
+    if !fs::exists(netns_path) is
+        let created: proc::RunResult = proc::run("ip", ["netns", "add", container_id])
+        if created.exit_code != 0 is return nil end
+    end
+
+    let result: proc::RunResult = proc::run("cnitool", ["add", network_name, netns_path])
+    if result.exit_code != 0 is return nil end
+
+    let parsed: any? = json::parse(result.stdout)
+    if parsed == nil is return nil end
+    let ips: [any] = json::get_array(parsed, "ips")
+    if array_len(ips) == 0 is return "" end
+    let addr: string = json::get_string(ips[0], "address", "")
+    let slash: int = str::find(addr, "/")
+    if slash >= 0 is return str::slice(addr, 0, slash) end
+    return addr
+end
+
+pub fn cni_del(network_name: string, container_id: string, netns_path: string) -> bool is
+    let result: proc::RunResult = proc::run("cnitool", ["del", network_name, netns_path])
+    proc::run("ip", ["netns", "del", container_id]) ;; best-effort, ignore result
+    return result.exit_code == 0
+end
+
+pub fn list_networks() -> [string] is
+    let cni_dir: string = "/etc/cni/net.d"
+    if !fs::exists(cni_dir) is return [] end
+
+    let mut networks: [string] = []
+    for entry in fs::list_dir(cni_dir) is
+        if str::ends_with(entry, ".conf") || str::ends_with(entry, ".conflist") is
+            let content: string? = utils::read_file(cni_dir + "/" + entry)
+            if content != nil is
+                let parsed: any? = json::parse(content)
+                if parsed != nil is
+                    let name: string = json::get_string(parsed, "name", "")
+                    if name != "" is networks = array_push(networks, name) end
+                end
+            end
+        end
+    end
+    return networks
+end
