@@ -1,0 +1,249 @@
+use "bit -> colors"
+
+mod utils
+
+;; ── Output primitives ────────────────────────────────────────────────────────
+
+pub fn out(s: string) is
+    write(s)
+end
+
+pub fn blank() is
+    write("")
+end
+
+pub fn disable_color() is
+    colors::disable()
+end
+
+;; ── Banner and headings ──────────────────────────────────────────────────────
+
+pub fn banner(version: string) is
+    let art: [string] = [
+        "  _   _            _             ___  ____    ",
+        " | | | | __ _  ___| | _____ _ __/ _ \\/ ___|   ",
+        " | |_| |/ _` |/ __| |/ / _ \\ '__| | | \\___ \\   ",
+        " |  _  | (_| | (__|   <  __/ |  | |_| |___) |  ",
+        " |_| |_|\\__,_|\\___|_|\\_\\___|_|   \\___/|____/   "
+    ]
+    let mut i: int = 0
+    while i < array_len(art) is
+        write(colors::gradient::text(art[i], "deepskyblue", "mediumpurple"))
+        i += 1
+    end
+    write("  " + colors::bold(colors::fg::deepskyblue("Containers")) + colors::theme::muted("  v" + version + "  ·  powered by container + colors"))
+    blank()
+end
+
+pub fn title(msg: string) is
+    write(colors::gradient::text("▍" + msg, "deepskyblue", "mediumpurple"))
+end
+
+pub fn section(msg: string) is
+    blank()
+    write(colors::bold(colors::fg::deepskyblue(msg)))
+    write(colors::theme::muted(string_repeat("─", utils::max_int(colors::util::visible_len(msg), 12))))
+end
+
+;; ── Messages ─────────────────────────────────────────────────────────────────
+
+pub fn success(msg: string) is
+    write(colors::theme::success(msg))
+end
+
+pub fn error(msg: string) is
+    write(colors::theme::error(msg))
+end
+
+pub fn warn(msg: string) is
+    write(colors::theme::warning(msg))
+end
+
+pub fn info(msg: string) is
+    write(colors::theme::info(msg))
+end
+
+pub fn hint(msg: string) is
+    write(colors::theme::hint(msg))
+end
+
+pub fn step(n: int, total: int, msg: string) is
+    write(colors::theme::step(n, total, msg))
+end
+
+pub fn muted(msg: string) -> string is
+    return colors::theme::muted(msg)
+end
+
+;; Prints an error and returns exit code 1 so callers can `return ui::fail(...)`.
+pub fn fail(msg: string) -> int is
+    write(colors::theme::error(msg))
+    return 1
+end
+
+pub fn fail_hint(msg: string, hint_text: string) -> int is
+    write(colors::theme::error(msg))
+    write(colors::theme::hint(hint_text))
+    return 1
+end
+
+;; ── Key / value blocks ───────────────────────────────────────────────────────
+
+pub fn kv(key: string, value: string) is
+    write("  " + colors::util::pad_right(colors::theme::key(key), 16) + " " + value)
+end
+
+pub fn kv_list(key: string, values: [string]) is
+    if array_len(values) == 0 is
+        kv(key, colors::theme::muted("—"))
+        return
+    end
+    kv(key, values[0])
+    let mut i: int = 1
+    while i < array_len(values) is
+        write("  " + string_repeat(" ", 17) + values[i])
+        i += 1
+    end
+end
+
+;; ── Badges and status colouring ──────────────────────────────────────────────
+
+pub fn status_badge(status: string) -> string is
+    let s: string = string_lower(status)
+    if s == "running" || s == "up" || s == "healthy" || s == "ok" is
+        return colors::bold(colors::fg::limegreen("● " + s))
+    end
+    if s == "created" || s == "paused" || s == "starting" is
+        return colors::fg::gold("◐ " + s)
+    end
+    if s == "exited" || s == "stopped" is
+        return colors::fg::darkgray("○ " + s)
+    end
+    if s == "dead" || s == "failed" || s == "unhealthy" || s == "error" is
+        return colors::bold(colors::fg::crimson("✖ " + s))
+    end
+    return colors::theme::muted("? " + s)
+end
+
+pub fn bool_mark(v: bool) -> string is
+    if v is return colors::fg::limegreen("✔") end
+    return colors::fg::crimson("✘")
+end
+
+pub fn check_line(label: string, good: bool, detail: string) is
+    let mark: string = if good then colors::theme::ok_badge() else colors::theme::fail_badge() end
+    write("  " + mark + " " + colors::util::pad_right(label, 22) + " " + colors::theme::muted(detail))
+end
+
+pub fn warn_line(label: string, detail: string) is
+    write("  " + colors::theme::warn_badge() + " " + colors::util::pad_right(label, 22) + " " + colors::theme::muted(detail))
+end
+
+;; ── Bars ─────────────────────────────────────────────────────────────────────
+
+;; A usage bar `width` cells wide: green → yellow → red as `pct` grows.
+pub fn usage_bar(pct: int, width: int) -> string is
+    let mut p: int = pct
+    if p < 0 is p = 0 end
+    if p > 100 is p = 100 end
+    let filled: int = (p * width) / 100
+    let mut to: string = "limegreen"
+    if p >= 85 is
+        to = "crimson"
+    else if p >= 60 is
+        to = "orange"
+    end
+    let mut bar: string = ""
+    if filled > 0 is bar = colors::gradient::bar(filled, "limegreen", to) end
+    let rest: string = colors::theme::muted(string_repeat("░", width - filled))
+    return bar + rest + " " + colors::util::pad_left(to_string(p) + "%", 4)
+end
+
+;; ── Tables ───────────────────────────────────────────────────────────────────
+;; A table is a header row plus rows; cells may contain colours (width is the
+;; visible width). Columns are padded to the widest cell.
+
+pub struct Table is
+    pub t_head: [string]
+    pub t_rows: [[string]]
+end
+
+pub fn table(head: [string]) -> Table is
+    let rows: [[string]] = []
+    return Table { t_head: head, t_rows: rows }
+end
+
+pub fn add_row(t: Table, row: [string]) -> Table is
+    let mut rows: [[string]] = t.t_rows
+    rows = array_push(rows, row)
+    return Table { t_head: t.t_head, t_rows: rows }
+end
+
+pub fn row_count(t: Table) -> int is
+    return array_len(t.t_rows)
+end
+
+pub fn print_table(t: Table) is
+    let cols: int = array_len(t.t_head)
+    let mut widths: [int] = []
+    let mut c: int = 0
+    while c < cols is
+        let mut w: int = colors::util::visible_len(t.t_head[c])
+        let mut r: int = 0
+        while r < array_len(t.t_rows) is
+            if c < array_len(t.t_rows[r]) is
+                let cw: int = colors::util::visible_len(t.t_rows[r][c])
+                if cw > w is w = cw end
+            end
+            r += 1
+        end
+        widths = array_push(widths, w)
+        c += 1
+    end
+    let mut head: string = ""
+    c = 0
+    while c < cols is
+        head = head + colors::util::pad_right(colors::bold(colors::fg::deepskyblue(t.t_head[c])), widths[c]) + "  "
+        c += 1
+    end
+    write(head)
+    let mut total: int = 0
+    c = 0
+    while c < cols is
+        total = total + widths[c] + 2
+        c += 1
+    end
+    write(colors::theme::muted(string_repeat("─", total)))
+    let mut r2: int = 0
+    while r2 < array_len(t.t_rows) is
+        let mut line: string = ""
+        let mut k: int = 0
+        while k < cols is
+            let mut cell: string = ""
+            if k < array_len(t.t_rows[r2]) is cell = t.t_rows[r2][k] end
+            line = line + colors::util::pad_right(cell, widths[k]) + "  "
+            k += 1
+        end
+        write(line)
+        r2 += 1
+    end
+end
+
+;; ── Confirmation ─────────────────────────────────────────────────────────────
+
+pub fn confirm(question: string) -> bool is
+    write(colors::theme::warning(question + " [y/N] "))
+    let ans: string = string_lower(string_trim(env_read_line()))
+    return ans == "y" || ans == "yes"
+end
+
+;; ── Help rendering ───────────────────────────────────────────────────────────
+
+pub fn help_group(name: string) is
+    blank()
+    write(colors::bold(colors::fg::gold(name)))
+end
+
+pub fn help_cmd(cmd: string, args: string, desc: string) is
+    write("  " + colors::util::pad_right(colors::fg::deepskyblue(cmd), 11) + colors::util::pad_right(colors::theme::muted(args), 24) + desc)
+end
