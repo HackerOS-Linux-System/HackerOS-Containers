@@ -1,0 +1,64 @@
+use "bit -> container" from "ctr"
+
+mod utils
+mod ui
+
+;; Applies the global --root / --driver flags before the store is opened.
+pub fn configure(root: string, driver: string) is
+    if root != "" is env_set("CONTAINER_ROOT", root) end
+    if driver != "" is env_set("CONTAINER_DRIVER", driver) end
+end
+
+;; Resolves a name / id / unique id prefix, printing an error when unknown.
+pub fn resolve(s: ctr::store::Store, ref_text: string) -> string is
+    let id: string = ctr::container_find(s, ref_text)
+    if id == "" is
+        ui::error("no such container: " + ref_text)
+        ui::hint("list containers with: hco ps -a")
+    end
+    return id
+end
+
+pub fn resolve_image(s: ctr::store::Store, ref_text: string) -> string is
+    let id: string = ctr::image_resolve(s, ref_text)
+    if id == "" is
+        ui::error("no such image: " + ref_text)
+        ui::hint("pull it first: hco pull " + ref_text)
+    end
+    return id
+end
+
+;; Name of a container ("" for none) from its state.
+pub fn name_of(s: ctr::store::Store, id: string) -> string is
+    let all: [ctr::runtime::ContainerInfo] = ctr::container_list(s)
+    let mut i: int = 0
+    while i < array_len(all) is
+        if all[i].ci_id == id is return all[i].ci_name end
+        i += 1
+    end
+    return ""
+end
+
+pub fn is_running(s: ctr::store::Store, id: string) -> bool is
+    return ctr::container_status(s, id) == "running"
+end
+
+;; Ids of all containers, optionally only the running ones.
+pub fn ids(s: ctr::store::Store, only_running: bool) -> [string] is
+    let all: [ctr::runtime::ContainerInfo] = ctr::container_list(s)
+    let mut out: [string] = []
+    let mut i: int = 0
+    while i < array_len(all) is
+        if !only_running || all[i].ci_status == "running" is out = array_push(out, all[i].ci_id) end
+        i += 1
+    end
+    return out
+end
+
+;; Unix seconds since a container was started (0 when not running).
+pub fn uptime_secs(s: ctr::store::Store, id: string) -> int is
+    let pid: int = ctr::container_pid(s, id)
+    if pid <= 0 is return 0 end
+    let t: string = utils::capture("ps -o etimes= -p " + to_string(pid) + " 2>/dev/null")
+    return utils::atoi(t)
+end
