@@ -1,51 +1,362 @@
-use "std -> strings" from "str"
-use "std -> fs" from "fs"
-use "std -> path" from "path"
-use "std -> crypto" from "crypto"
-
-;; Parse a human memory size ("512MB", "2GB", "100KB", "10B", or a bare
-;; number of bytes) into a byte count. Unknown/garbage input -> 0, same
-;; behaviour as the original `unwrap_or(0)`.
-pub fn parse_bytes(raw: string) -> int is
-    let s: string = str::to_upper(raw)
-    if str::ends_with(s, "GB") is
-        return conv::str_to_int(str::slice(s, 0, str::len(s) - 2)) * 1073741824
-    end
-    if str::ends_with(s, "MB") is
-        return conv::str_to_int(str::slice(s, 0, str::len(s) - 2)) * 1048576
-    end
-    if str::ends_with(s, "KB") is
-        return conv::str_to_int(str::slice(s, 0, str::len(s) - 2)) * 1024
-    end
-    if str::ends_with(s, "B") is
-        return conv::str_to_int(str::slice(s, 0, str::len(s) - 1))
-    end
-    return conv::str_to_int(s)
+extern static [c] is
+    fn system(cmd: string) -> int
 end
 
-;; Locally-administered, unicast random MAC — the leading octet is fixed
-;; to 0x02 for the same reason the Rust version did (bit 0 = unicast,
-;; bit 1 = locally administered).
-pub fn random_mac() -> string is
-    let bytes: bytes = crypto::random_bytes(5)
-    let mut parts: [string] = [conv::int_to_hex_padded(2, 2)]
+;; ── Shell ────────────────────────────────────────────────────────────────────
+
+;; POSIX single-quote a value so it is safe inside a shell command line.
+pub fn sq(s: string) -> string is
+    return "'" + string_replace(s, "'", "'\\''") + "'"
+end
+
+;; Exit code of a command line (stdin/stdout/stderr are inherited).
+pub fn run(cmd: string) -> int is
+    let rc: int = system(cmd)
+    if rc > 255 is return rc / 256 end
+    return rc
+end
+
+pub fn ok(cmd: string) -> bool is
+    return run(cmd) == 0
+end
+
+;; Exit code of a command whose output is thrown away.
+pub fn quiet(cmd: string) -> int is
+    return run("( " + cmd + " ) >/dev/null 2>&1")
+end
+
+;; stdout+stderr of a command, trimmed.
+pub fn capture(cmd: string) -> string is
+    return string_trim(shell(cmd))
+end
+
+pub fn tool_exists(name: string) -> bool is
+    return quiet("command -v " + sq(name)) == 0
+end
+
+;; First tool of `names` that is installed, "" when none is.
+pub fn first_tool(names: [string]) -> string is
     let mut i: int = 0
-    while i < 5 is
-        parts = array_push(parts, conv::int_to_hex_padded(buf::byte_at(bytes, i), 2))
+    while i < array_len(names) is
+        if tool_exists(names[i]) is return names[i] end
         i += 1
     end
-    return str::join(parts, ":")
+    return ""
 end
 
-pub fn write_to_file(target_path: string, content: string) -> bool is
-    let parent: string = path::parent(target_path)
-    if parent != "" && !fs::exists(parent) is
-        fs::mkdir_all(parent)
+;; ── Environment ──────────────────────────────────────────────────────────────
+
+pub fn env_or(name: string, fallback: string) -> string is
+    let v: string = env_get(name)
+    if v == "" is return fallback end
+    return v
+end
+
+pub fn is_root() -> bool is
+    return capture("id -u") == "0"
+end
+
+pub fn now_ms() -> int is
+    return time_ms()
+end
+
+pub fn now_unix() -> int is
+    return time_unix()
+end
+
+pub fn now_iso() -> string is
+    return capture("date -u +%Y-%m-%dT%H:%M:%SZ")
+end
+
+pub fn hostname() -> string is
+    let h: string = capture("hostname 2>/dev/null")
+    if h == "" is return "localhost" end
+    return h
+end
+
+;; ── Numbers ──────────────────────────────────────────────────────────────────
+
+pub fn digit_of(c: string) -> int is
+    if c == "0" is return 0 end
+    if c == "1" is return 1 end
+    if c == "2" is return 2 end
+    if c == "3" is return 3 end
+    if c == "4" is return 4 end
+    if c == "5" is return 5 end
+    if c == "6" is return 6 end
+    if c == "7" is return 7 end
+    if c == "8" is return 8 end
+    if c == "9" is return 9 end
+    return -1
+end
+
+pub fn is_number(s: string) -> bool is
+    if string_len(s) == 0 is return false end
+    let mut i: int = 0
+    while i < string_len(s) is
+        if digit_of(string_at(s, i)) < 0 is return false end
+        i += 1
     end
-    return fs::write(target_path, content)
+    return true
 end
 
-pub fn read_file(target_path: string) -> string? is
-    if !fs::exists(target_path) is return nil end
-    return fs::read(target_path)
+pub fn atoi(s_in: string) -> int is
+    let s: string = string_trim(s_in)
+    let mut n: int = 0
+    let mut neg: bool = false
+    let mut i: int = 0
+    if string_len(s) > 0 && string_at(s, 0) == "-" is
+        neg = true
+        i = 1
+    end
+    while i < string_len(s) is
+        let d: int = digit_of(string_at(s, i))
+        if d < 0 is break end
+        n = n * 10 + d
+        i += 1
+    end
+    if neg is return 0 - n end
+    return n
+end
+
+;; "256m" / "2g" / "1024" -> bytes. -1 when the text is not a size.
+pub fn parse_size(s_in: string) -> int is
+    let s: string = string_lower(string_trim(s_in))
+    if s == "" is return -1 end
+    let last: string = string_at(s, string_len(s) - 1)
+    let mut mult: int = 1
+    let mut body: string = s
+    if last == "k" is
+        mult = 1024
+        body = string_slice(s, 0, string_len(s) - 1)
+    else if last == "m" is
+        mult = 1048576
+        body = string_slice(s, 0, string_len(s) - 1)
+    else if last == "g" is
+        mult = 1073741824
+        body = string_slice(s, 0, string_len(s) - 1)
+    else if last == "t" is
+        mult = 1099511627776
+        body = string_slice(s, 0, string_len(s) - 1)
+    end
+    if !is_number(body) is return -1 end
+    return atoi(body) * mult
+end
+
+;; 1536 -> "1.5 KB"
+pub fn human_bytes(n: int) -> string is
+    if n < 1024 is return to_string(n) + " B" end
+    let units: [string] = ["KB", "MB", "GB", "TB"]
+    let mut v: int = n * 10
+    let mut u: int = -1
+    while v >= 10240 && u < 3 is
+        v = v / 1024
+        u += 1
+    end
+    let whole: int = v / 10
+    let frac: int = v - whole * 10
+    return to_string(whole) + "." + to_string(frac) + " " + units[u]
+end
+
+;; seconds -> "2d 3h" / "5m 12s" / "42s"
+pub fn human_duration(sec: int) -> string is
+    if sec < 0 is return "0s" end
+    if sec < 60 is return to_string(sec) + "s" end
+    if sec < 3600 is return to_string(sec / 60) + "m " + to_string(sec % 60) + "s" end
+    if sec < 86400 is return to_string(sec / 3600) + "h " + to_string((sec % 3600) / 60) + "m" end
+    return to_string(sec / 86400) + "d " + to_string((sec % 86400) / 3600) + "h"
+end
+
+;; ── Strings and lists ────────────────────────────────────────────────────────
+
+pub fn or_default(v: string, fallback: string) -> string is
+    if v == "" is return fallback end
+    return v
+end
+
+pub fn join(items: [string], sep: string) -> string is
+    let mut out: string = ""
+    let mut i: int = 0
+    while i < array_len(items) is
+        if i > 0 is out = out + sep end
+        out = out + items[i]
+        i += 1
+    end
+    return out
+end
+
+pub fn has(items: [string], needle: string) -> bool is
+    let mut i: int = 0
+    while i < array_len(items) is
+        if items[i] == needle is return true end
+        i += 1
+    end
+    return false
+end
+
+pub fn without(items: [string], needle: string) -> [string] is
+    let mut out: [string] = []
+    let mut i: int = 0
+    while i < array_len(items) is
+        if items[i] != needle is out = array_push(out, items[i]) end
+        i += 1
+    end
+    return out
+end
+
+;; Non-empty, trimmed lines of a text.
+pub fn lines(text: string) -> [string] is
+    let raw: [string] = string_split(text, "\n")
+    let mut out: [string] = []
+    let mut i: int = 0
+    while i < array_len(raw) is
+        let l: string = string_trim(raw[i])
+        if l != "" is out = array_push(out, l) end
+        i += 1
+    end
+    return out
+end
+
+;; Text after the first `sep` ("" when there is none).
+pub fn tail_after(s: string, sep: string) -> string is
+    let i: int = string_find(s, sep)
+    if i < 0 is return "" end
+    return string_slice(s, i + string_len(sep), string_len(s))
+end
+
+;; Text before the first `sep` (the whole string when there is none).
+pub fn head_before(s: string, sep: string) -> string is
+    let i: int = string_find(s, sep)
+    if i < 0 is return s end
+    return string_slice(s, 0, i)
+end
+
+pub fn basename(path: string) -> string is
+    let i: int = string_rfind(path, "/")
+    if i < 0 is return path end
+    return string_slice(path, i + 1, string_len(path))
+end
+
+pub fn short_id(id: string) -> string is
+    if string_len(id) > 12 is return string_slice(id, 0, 12) end
+    return id
+end
+
+;; ── Files ────────────────────────────────────────────────────────────────────
+
+pub fn exists(path: string) -> bool is
+    return file_exists(path) || dir_exists(path)
+end
+
+pub fn is_dir(path: string) -> bool is
+    return dir_exists(path)
+end
+
+pub fn mkdir_p(path: string) is
+    quiet("mkdir -p " + sq(path))
+end
+
+pub fn rm_rf(path: string) -> bool is
+    return quiet("rm -rf " + sq(path)) == 0
+end
+
+pub fn read(path: string) -> string is
+    if !file_exists(path) is return "" end
+    return file_read(path)
+end
+
+pub fn read_trim(path: string) -> string is
+    return string_trim(read(path))
+end
+
+pub fn write_file(path: string, data: string) is
+    mkdir_p(dirname(path))
+    file_write(path, data)
+end
+
+pub fn append_line(path: string, line: string) is
+    mkdir_p(dirname(path))
+    quiet("printf '%s\\n' " + sq(line) + " >> " + sq(path))
+end
+
+pub fn dirname(path: string) -> string is
+    let i: int = string_rfind(path, "/")
+    if i < 0 is return "." end
+    if i == 0 is return "/" end
+    return string_slice(path, 0, i)
+end
+
+;; Names (not paths) of the entries of a directory, sorted.
+pub fn list_dir(path: string) -> [string] is
+    if !dir_exists(path) is return [] end
+    return lines(capture("ls -1 " + sq(path) + " 2>/dev/null"))
+end
+
+pub fn dir_size(path: string) -> int is
+    let out: string = capture("du -sb " + sq(path) + " 2>/dev/null | cut -f1")
+    return atoi(out)
+end
+
+;; ── key=value files ──────────────────────────────────────────────────────────
+
+pub fn kv_get(path: string, key: string) -> string is
+    let ls: [string] = lines(read(path))
+    let mut i: int = 0
+    while i < array_len(ls) is
+        if head_before(ls[i], "=") == key is return tail_after(ls[i], "=") end
+        i += 1
+    end
+    return ""
+end
+
+pub fn kv_set(path: string, key: string, value: string) is
+    let ls: [string] = lines(read(path))
+    let mut out: [string] = []
+    let mut i: int = 0
+    while i < array_len(ls) is
+        if head_before(ls[i], "=") != key is out = array_push(out, ls[i]) end
+        i += 1
+    end
+    out = array_push(out, key + "=" + value)
+    write_file(path, join(out, "\n") + "\n")
+end
+
+pub fn kv_del(path: string, key: string) is
+    let ls: [string] = lines(read(path))
+    let mut out: [string] = []
+    let mut i: int = 0
+    while i < array_len(ls) is
+        if head_before(ls[i], "=") != key is out = array_push(out, ls[i]) end
+        i += 1
+    end
+    write_file(path, join(out, "\n") + "\n")
+end
+
+pub fn eprint(msg: string) is
+    system("printf '%s\\n' " + sq(msg) + " >&2")
+end
+
+pub fn max_int(a: int, b: int) -> int is
+    if a > b is return a end
+    return b
+end
+
+pub fn min_int(a: int, b: int) -> int is
+    if a < b is return a end
+    return b
+end
+
+pub fn join_arrays(a: [string], b: [string]) -> [string] is
+    let mut out: [string] = []
+    let mut i: int = 0
+    while i < array_len(a) is
+        out = array_push(out, a[i])
+        i += 1
+    end
+    let mut j: int = 0
+    while j < array_len(b) is
+        out = array_push(out, b[j])
+        j += 1
+    end
+    return out
 end
