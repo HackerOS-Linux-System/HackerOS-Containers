@@ -1,0 +1,120 @@
+use "bit -> container" from "ctr"
+use "bit -> colors"
+
+mod utils
+mod ui
+mod args
+mod validation
+mod db
+
+fn vol_dir(s: ctr::store::Store, name: string) -> string is
+    return s.st_root + "/volumes/" + name
+end
+
+;; True when any container's configuration mentions the volume.
+fn in_use(s: ctr::store::Store, name: string) -> bool is
+    let all: [ctr::runtime::ContainerInfo] = ctr::container_list(s)
+    let mut i: int = 0
+    while i < array_len(all) is
+        if string_contains(ctr::container_inspect(s, all[i].ci_id), "/volumes/" + name) is return true end
+        i += 1
+    end
+    return false
+end
+
+fn usage() -> int is
+    ui::title("hco volume")
+    ui::help_cmd("create", "NAME", "create a named volume")
+    ui::help_cmd("ls", "", "list volumes with their size")
+    ui::help_cmd("inspect", "NAME", "show where a volume lives")
+    ui::help_cmd("rm", "NAME...", "remove volumes")
+    ui::help_cmd("prune", "[-f]", "remove volumes no container uses")
+    return 0
+end
+
+pub fn cmd_volume(s: ctr::store::Store, argv: [string]) -> int is
+    if array_len(argv) == 0 is return usage() end
+    let sub: string = argv[0]
+    let names: [string] = args::argv_tail(argv, 1)
+    if sub == "create" is
+        if array_len(names) != 1 is return ui::fail("usage: hco volume create NAME") end
+        let bad: string = validation::name(names[0])
+        if bad != "" is return ui::fail("volume name: " + bad) end
+        if utils::is_dir(vol_dir(s, names[0])) is return ui::fail("volume " + names[0] + " already exists") end
+        utils::mkdir_p(vol_dir(s, names[0]))
+        db::event(s, "volume", names[0], "create")
+        ui::success("volume " + colors::bold(names[0]) + " created")
+        return 0
+    end
+    if sub == "ls" || sub == "list" is
+        let all: [string] = utils::list_dir(s.st_root + "/volumes")
+        if array_len(all) == 0 is
+            ui::info("no volumes")
+            return 0
+        end
+        let mut t = ui::table(["VOLUME", "SIZE", "USED BY", "PATH"])
+        let mut i: int = 0
+        while i < array_len(all) is
+            t = ui::add_row(t, [colors::bold(all[i]), utils::human_bytes(utils::dir_size(vol_dir(s, all[i]))), if in_use(s, all[i]) then colors::fg::limegreen("in use") else ui::muted("unused") end, ui::muted(vol_dir(s, all[i]))])
+            i += 1
+        end
+        ui::print_table(t)
+        return 0
+    end
+    if sub == "inspect" is
+        if array_len(names) != 1 is return ui::fail("usage: hco volume inspect NAME") end
+        if !utils::is_dir(vol_dir(s, names[0])) is return ui::fail("no such volume: " + names[0]) end
+        ui::title("volume " + names[0])
+        ui::kv("Path", vol_dir(s, names[0]))
+        ui::kv("Size", utils::human_bytes(utils::dir_size(vol_dir(s, names[0]))))
+        ui::kv("In use", ui::bool_mark(in_use(s, names[0])))
+        return 0
+    end
+    if sub == "rm" || sub == "remove" is
+        if array_len(names) == 0 is return ui::fail("usage: hco volume rm NAME...") end
+        let mut failed: int = 0
+        let mut i2: int = 0
+        while i2 < array_len(names) is
+            if !utils::is_dir(vol_dir(s, names[i2])) is
+                ui::error("no such volume: " + names[i2])
+                failed += 1
+            else if in_use(s, names[i2]) is
+                ui::error("volume " + names[i2] + " is in use")
+                failed += 1
+            else is
+                utils::rm_rf(vol_dir(s, names[i2]))
+                ui::success("removed " + names[i2])
+            end
+            i2 += 1
+        end
+        if failed > 0 is return 1 end
+        return 0
+    end
+    if sub == "prune" is
+        let p = args::parse(names, [], false)
+        let all2: [string] = utils::list_dir(s.st_root + "/volumes")
+        let mut victims: [string] = []
+        let mut k: int = 0
+        while k < array_len(all2) is
+            if !in_use(s, all2[k]) is victims = array_push(victims, all2[k]) end
+            k += 1
+        end
+        if array_len(victims) == 0 is
+            ui::info("no unused volumes")
+            return 0
+        end
+        if !args::flag(p, ["-f", "--force"]) && !ui::confirm("remove " + to_string(array_len(victims)) + " unused volume(s)?") is
+            ui::info("cancelled")
+            return 0
+        end
+        let mut v: int = 0
+        while v < array_len(victims) is
+            utils::rm_rf(vol_dir(s, victims[v]))
+            v += 1
+        end
+        ui::success("removed " + to_string(array_len(victims)) + " volume(s)")
+        return 0
+    end
+    ui::error("unknown volume command: " + sub)
+    return usage()
+end
