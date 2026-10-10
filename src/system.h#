@@ -1,89 +1,257 @@
-pub const CLONE_NEWNS:    int = 0x00020000
-pub const CLONE_NEWUTS:   int = 0x04000000
-pub const CLONE_NEWIPC:   int = 0x08000000
-pub const CLONE_NEWUSER:  int = 0x10000000
-pub const CLONE_NEWPID:   int = 0x20000000
-pub const CLONE_NEWNET:   int = 0x40000000
+use "bit -> container" from "ctr"
+use "bit -> colors"
 
-pub const MS_BIND:   int = 4096
-pub const MS_REC:    int = 16384
-pub const MNT_DETACH: int = 2
+mod utils
+mod ui
+mod args
+mod backend
+mod db
+mod config
+mod metrics
 
-pub const SIGTERM: int = 15
-pub const SIGKILL: int = 9
-pub const SIGCHLD: int = 17
-
-extern static [c] is
-    ;; process / namespace control
-    fn unshare(flags: int) -> int
-    fn setns(fd: int, nstype: int) -> int
-    fn syscall_clone(flags: int, child_stack: int) -> int
-    fn fork_raw() -> int
-    fn execve_raw(path: string, argv: string, envp: string) -> int
-    fn waitpid_raw(pid: int, options: int) -> int
-    fn kill_raw(pid: int, sig: int) -> int
-    fn getpid_raw() -> int
-    fn getuid_raw() -> int
-    fn getgid_raw() -> int
-    fn setuid_raw(uid: int) -> int
-    fn setgid_raw(gid: int) -> int
-    fn sethostname_raw(name: string, len: int) -> int
-    fn chdir_raw(path: string) -> int
-    fn setsid_raw() -> int
-
-    ;; mount family
-    fn mount_raw(src: string, target: string, fstype: string, flags: int, data: string) -> int
-    fn umount2_raw(target: string, flags: int) -> int
-    fn pivot_root_raw(new_root: string, old_root: string) -> int
-
-    ;; pty
-    fn openpty_raw(master_out: int, slave_out: int) -> int
-    fn dup2_raw(oldfd: int, newfd: int) -> int
+pub fn version() -> string is
+    return "2.0.0"
 end
 
-;; ── Friendly wrappers ─────────────────────────────────────────────────────────
-
-pub fn is_root() -> bool is
-    return getuid_raw() == 0
+fn lb() -> string is
+    return "{"
 end
 
-pub fn current_pid() -> int is
-    return getpid_raw()
+fn rb() -> string is
+    return "}"
 end
 
-pub fn bind_mount(src: string, target: string) -> bool is
-    return mount_raw(src, target, "", MS_BIND | MS_REC, "") == 0
+pub fn commands() -> [string] is
+    return ["run", "create", "start", "stop", "restart", "kill", "rm", "ps", "logs", "exec", "inspect", "top", "stats", "wait", "rename", "port", "health", "prune", "supervise", "images", "pull", "rmi", "tag", "history", "build", "save", "load", "import", "push", "login", "logout", "image", "pod", "volume", "network", "seccomp", "up", "down", "serve", "api", "tls", "doctor", "info", "df", "events", "metrics", "config", "preset", "completion", "version", "help"]
 end
 
-pub fn mount_pseudo(fstype: string, target: string) -> bool is
-    return mount_raw(fstype, target, fstype, 0, "") == 0
+;; hco version
+pub fn cmd_version(argv: [string]) -> int is
+    let p = args::parse(argv, [], false)
+    if args::flag(p, ["-s", "--short"]) is
+        write(version())
+        return 0
+    end
+    ui::banner(version())
+    ui::kv("hco", version())
+    ui::kv("container lib", ctr::version())
+    ui::kv("colors lib", colors::version())
+    ui::kv("colour depth", colors::support::level_name() + " (" + to_string(colors::color_count()) + " colours)")
+    return 0
 end
 
-pub fn mount_overlay(target: string, opts: string) -> bool is
-    return mount_raw("overlay", target, "overlay", 0, opts) == 0
+;; hco doctor
+pub fn cmd_doctor(s: ctr::store::Store) -> int is
+    ui::title("hco doctor")
+    ui::section("Runtime (container library)")
+    let lines: [string] = ctr::doctor()
+    let mut bad: int = 0
+    let mut i: int = 0
+    while i < array_len(lines) is
+        let l: string = lines[i]
+        if string_starts_with(l, "ok") is
+            ui::check_line(string_trim(string_slice(l, 2, string_len(l))), true, "")
+        else if string_starts_with(l, "MISSING") is
+            ui::check_line(string_trim(string_slice(l, 7, string_len(l))), false, "")
+            bad += 1
+        else is
+            ui::out("  " + ui::muted(l))
+        end
+        i += 1
+    end
+    ui::section("HackerOS extras")
+    let extras: [string] = ["jq|pretty JSON, seccomp patching", "socat|hco serve (REST API)", "openssl|hco tls init", "cnitool|CNI networks", "crun|OCI runtime with seccomp", "runc|OCI runtime with seccomp"]
+    let mut k: int = 0
+    while k < array_len(extras) is
+        let tool: string = utils::head_before(extras[k], "|")
+        if utils::tool_exists(tool) is
+            ui::check_line(tool, true, utils::tail_after(extras[k], "|"))
+        else is
+            ui::warn_line(tool, utils::tail_after(extras[k], "|") + " — not installed")
+        end
+        k += 1
+    end
+    ui::section("Store")
+    ui::check_line("store directory", utils::is_dir(s.st_root), s.st_root)
+    ui::check_line("storage driver", true, s.st_driver)
+    ui::blank()
+    if bad == 0 is
+        ui::success("this host is ready to run containers")
+        return 0
+    end
+    ui::error(to_string(bad) + " required check(s) failed")
+    return 1
 end
 
-pub fn lazy_unmount(target: string) -> bool is
-    return umount2_raw(target, MNT_DETACH) == 0
+;; hco info
+pub fn cmd_info(s: ctr::store::Store) -> int is
+    let h: ctr::host::HostInfo = ctr::host_info()
+    let all: [ctr::runtime::ContainerInfo] = ctr::container_list(s)
+    let mut running: int = 0
+    let mut i: int = 0
+    while i < array_len(all) is
+        if all[i].ci_status == "running" is running += 1 end
+        i += 1
+    end
+    ui::banner(version())
+    ui::section("Host")
+    ui::kv("Architecture", h.hi_arch)
+    ui::kv("Kernel", h.hi_kernel)
+    ui::kv("Privileges", if h.hi_root then "root" else "unprivileged" end)
+    ui::kv("Cgroups", "v" + to_string(h.hi_cgroup) + " " + ui::bool_mark(h.hi_cgroup_ok))
+    ui::section("Store")
+    ui::kv("Root", s.st_root)
+    ui::kv("Driver", s.st_driver)
+    ui::kv("Containers", to_string(array_len(all)) + "  (" + colors::fg::limegreen(to_string(running) + " running") + ")")
+    ui::kv("Images", to_string(array_len(ctr::image_list(s))))
+    ui::kv("Pods", to_string(array_len(db::pod_names(s))))
+    ui::kv("Volumes", to_string(array_len(utils::list_dir(s.st_root + "/volumes"))))
+    return 0
 end
 
-pub fn pivot(new_root: string, old_root_rel: string) -> bool is
-    return pivot_root_raw(new_root, old_root_rel) == 0
+;; hco df — disk usage of the store.
+pub fn cmd_df(s: ctr::store::Store) -> int is
+    let parts: [string] = ["images|blobs", "layers|layers", "containers|containers", "volumes|volumes"]
+    let mut sizes: [int] = []
+    let mut total: int = 0
+    let mut i: int = 0
+    while i < array_len(parts) is
+        let sz: int = utils::dir_size(s.st_root + "/" + utils::tail_after(parts[i], "|"))
+        sizes = array_push(sizes, sz)
+        total = total + sz
+        i += 1
+    end
+    ui::title("disk usage")
+    ui::out("  " + ui::muted(s.st_root))
+    let mut t = ui::table(["TYPE", "SIZE", "SHARE"])
+    let mut k: int = 0
+    while k < array_len(parts) is
+        let share: int = if total > 0 then (sizes[k] * 100) / total else 0 end
+        t = ui::add_row(t, [colors::bold(utils::head_before(parts[k], "|")), utils::human_bytes(sizes[k]), ui::usage_bar(share, 20)])
+        k += 1
+    end
+    ui::print_table(t)
+    ui::blank()
+    ui::out("  total " + colors::bold(utils::human_bytes(total)))
+    return 0
 end
 
-pub fn set_hostname(name: string) -> bool is
-    return sethostname_raw(name, string_len(name)) == 0
+fn event_line(l: string) -> string is
+    let ts: string = utils::head_before(l, "|")
+    let r1: string = utils::tail_after(l, "|")
+    let kind: string = utils::head_before(r1, "|")
+    let r2: string = utils::tail_after(r1, "|")
+    let obj: string = utils::head_before(r2, "|")
+    let msg: string = utils::tail_after(r2, "|")
+    let when: string = utils::capture("date -d @" + ts + " '+%H:%M:%S' 2>/dev/null")
+    return colors::theme::muted(utils::or_default(when, ts)) + " " + colors::util::pad_right(colors::fg::mediumpurple(kind), 10) + colors::util::pad_right(colors::theme::code(obj), 16) + msg
 end
 
-pub fn signal_process(pid: int, sig: int) -> bool is
-    return kill_raw(pid, sig) == 0
+;; hco events [-n N] [-f]
+pub fn cmd_events(s: ctr::store::Store, argv: [string]) -> int is
+    let p = args::parse(argv, ["-n", "--tail"], false)
+    let n: int = utils::atoi(utils::or_default(args::get(p, ["-n", "--tail"]), "20"))
+    let ls: [string] = db::events_tail(s, n)
+    if array_len(ls) == 0 && !args::flag(p, ["-f", "--follow"]) is
+        ui::info("no events yet")
+        return 0
+    end
+    let mut i: int = 0
+    while i < array_len(ls) is
+        write(event_line(ls[i]))
+        i += 1
+    end
+    if args::flag(p, ["-f", "--follow"]) is
+        let mut seen: int = utils::atoi(utils::capture("wc -l < " + utils::sq(db::events_path(s)) + " 2>/dev/null"))
+        while true is
+            sleep_ms(1000)
+            let now: int = utils::atoi(utils::capture("wc -l < " + utils::sq(db::events_path(s)) + " 2>/dev/null"))
+            if now > seen is
+                let fresh: [string] = db::events_tail(s, now - seen)
+                let mut k: int = 0
+                while k < array_len(fresh) is
+                    write(event_line(fresh[k]))
+                    k += 1
+                end
+                seen = now
+            end
+        end
+    end
+    return 0
 end
 
-;; Non-blocking waitpid — returns true when the child has already exited.
-pub fn try_reap(pid: int) -> bool is
-    return waitpid_raw(pid, 1) > 0 ;; WNOHANG = 1
+;; hco config — the merged global configuration.
+pub fn cmd_config() -> int is
+    let g: [string] = config::global()
+    let path: string = utils::or_default(env_get("HCO_CONFIG"), "/etc/hco/hco.hk")
+    ui::title("configuration  " + ui::muted(path))
+    if array_len(g) == 0 is
+        ui::info("no configuration file — using defaults")
+        ui::hint("create " + path + " with:  [hco]  /  -> log_level => debug")
+        return 0
+    end
+    let mut i: int = 0
+    while i < array_len(g) is
+        let rest: string = utils::tail_after(g[i], "|")
+        write("  " + ui::muted("[" + utils::head_before(g[i], "|") + "]") + " " + colors::theme::key(utils::head_before(rest, "|")) + " " + ui::muted("=>") + " " + utils::tail_after(rest, "|"))
+        i += 1
+    end
+    return 0
 end
 
-pub fn blocking_wait(pid: int) -> int is
-    return waitpid_raw(pid, 0)
+;; ── Shell completion ─────────────────────────────────────────────────────────
+
+fn bash_script() -> string is
+    let words: string = utils::join(commands(), " ")
+    return "_hco() " + lb() + "\n  local cur=\"$" + lb() + "COMP_WORDS[COMP_CWORD]" + rb() + "\"\n  if [ \"$COMP_CWORD\" -eq 1 ]; then\n    COMPREPLY=( $(compgen -W \"" + words + "\" -- \"$cur\") )\n  fi\n" + rb() + "\ncomplete -F _hco hco\n"
+end
+
+fn zsh_script() -> string is
+    return "#compdef hco\n_arguments '1: :(" + utils::join(commands(), " ") + ")'\n"
+end
+
+fn fish_script() -> string is
+    return "complete -c hco -f -n '__fish_use_subcommand' -a '" + utils::join(commands(), " ") + "'\n"
+end
+
+;; hco completion bash|zsh|fish
+pub fn cmd_completion(argv: [string]) -> int is
+    if array_len(argv) != 1 is return ui::fail_hint("usage: hco completion bash|zsh|fish", "install: hco completion bash > /etc/bash_completion.d/hco") end
+    if argv[0] == "bash" is
+        ui::out(bash_script())
+        return 0
+    end
+    if argv[0] == "zsh" is
+        ui::out(zsh_script())
+        return 0
+    end
+    if argv[0] == "fish" is
+        ui::out(fish_script())
+        return 0
+    end
+    return ui::fail("unknown shell: " + argv[0])
+end
+
+;; hco system prune [-f] — stopped containers, unused volumes, unreferenced blobs.
+pub fn cmd_system_prune(s: ctr::store::Store, argv: [string]) -> int is
+    let p = args::parse(argv, [], false)
+    if !args::flag(p, ["-f", "--force"]) && !ui::confirm("remove stopped containers and unreferenced image data?") is
+        ui::info("cancelled")
+        return 0
+    end
+    let list: [ctr::runtime::ContainerInfo] = ctr::container_list(s)
+    let mut n: int = 0
+    let mut i: int = 0
+    while i < array_len(list) is
+        if list[i].ci_status == "exited" || list[i].ci_status == "dead" is
+            if ctr::container_remove(s, list[i].ci_id, true) is
+                db::meta_drop(s, list[i].ci_id)
+                n += 1
+            end
+        end
+        i += 1
+    end
+    ctr::image_gc(s)
+    ui::success("removed " + to_string(n) + " container(s) and reclaimed unreferenced image data")
+    return 0
 end
