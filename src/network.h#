@@ -1,164 +1,79 @@
-use "std -> process" from "proc"
-use "std -> strings" from "str"
-use "std -> log" from "log"
-use "std -> fs" from "fs"
+use "bit -> container" from "ctr"
+use "bit -> colors"
 
+mod utils
+mod ui
+mod args
+mod backend
 mod cni
 
-pub fn setup_bridge(bridge_name: string, gateway: string) -> bool is
-    let show: proc::RunResult = proc::run("ip", ["link", "show", bridge_name])
-    let exists: bool = show.exit_code == 0
+fn usage() -> int is
+    ui::title("hco network")
+    ui::help_cmd("ls", "", "bridge, host, none and CNI networks")
+    ui::help_cmd("inspect", "", "bridge status and addressing")
+    ui::help_cmd("attach", "NET CONTAINER", "attach a running container to a CNI network")
+    ui::help_cmd("detach", "NET CONTAINER", "detach it again")
+    return 0
+end
 
-    if !exists is
-        let add: proc::RunResult = proc::run("ip", ["link", "add", "name", bridge_name, "type", "bridge"])
-        if add.exit_code != 0 is
-            log::error("Failed to create bridge " + bridge_name)
-            return false
+fn bridge_name() -> string is
+    return utils::or_default(env_get("CONTAINER_BRIDGE"), "container0")
+end
+
+pub fn cmd_network(s: ctr::store::Store, argv: [string]) -> int is
+    if array_len(argv) == 0 is return usage() end
+    let sub: string = argv[0]
+    if sub == "ls" || sub == "list" is
+        let mut t = ui::table(["NETWORK", "DRIVER", "DESCRIPTION"])
+        t = ui::add_row(t, [colors::bold("bridge"), "builtin", "NAT bridge " + bridge_name() + " with port publishing"])
+        t = ui::add_row(t, [colors::bold("host"), "builtin", "share the host's network stack"])
+        t = ui::add_row(t, [colors::bold("none"), "builtin", "loopback only"])
+        let extra: [string] = cni::networks()
+        let mut i: int = 0
+        while i < array_len(extra) is
+            t = ui::add_row(t, [colors::bold(extra[i]), colors::fg::mediumpurple("cni"), "defined in " + cni::conf_dir()])
+            i += 1
         end
-        log::info("Bridge created: " + bridge_name)
+        ui::print_table(t)
+        return 0
     end
-
-    let up: proc::RunResult = proc::run("ip", ["link", "set", bridge_name, "up"])
-    if up.exit_code != 0 is
-        log::error("Failed to bring bridge up: " + bridge_name)
-        return false
-    end
-
-    proc::run("ip", ["addr", "add", gateway, "dev", bridge_name]) ;; ignore "already assigned"
-
-    let fwd: proc::RunResult = proc::run("sysctl", ["-w", "net.ipv4.ip_forward=1"])
-    if fwd.exit_code != 0 is
-        log::error("Failed to enable IP forwarding")
-        return false
-    end
-
-    let check: proc::RunResult = proc::run("iptables",
-        ["-t", "nat", "-C", "POSTROUTING", "-s", "10.10.0.0/24", "!", "-d", "10.10.0.0/24", "-j", "MASQUERADE"])
-    if check.exit_code != 0 is
-        let add_rule: proc::RunResult = proc::run("iptables",
-            ["-t", "nat", "-A", "POSTROUTING", "-s", "10.10.0.0/24", "!", "-d", "10.10.0.0/24", "-j", "MASQUERADE"])
-        if add_rule.exit_code != 0 is
-            log::error("Failed to add iptables MASQUERADE rule")
-            return false
+    if sub == "inspect" is
+        let up: bool = utils::quiet("ip link show " + utils::sq(bridge_name())) == 0
+        ui::title("bridge " + bridge_name())
+        ui::kv("Present", ui::bool_mark(up))
+        if up is
+            ui::kv("Address", utils::or_default(utils::capture("ip -4 -o addr show " + utils::sq(bridge_name()) + " | tr -s ' ' | cut -d' ' -f4"), "—"))
+            ui::kv("Attached", utils::or_default(utils::capture("ip -o link show master " + utils::sq(bridge_name()) + " | wc -l"), "0"))
+        else is
+            ui::hint("the bridge is created when the first bridge-mode container starts")
         end
+        ui::kv("IP forwarding", ui::bool_mark(utils::read_trim("/proc/sys/net/ipv4/ip_forward") == "1"))
+        ui::kv("CNI", ui::bool_mark(cni::available()))
+        return 0
     end
-    return true
-end
-
-;; Returns (ip_addr, veth_host) on success.
-pub fn create_veth_pair(pid: int, suffix: int) -> (string, string)? is
-    let bridge: string = "hkbr0"
-    let veth_host: string = "veth" + to_string(pid)
-    let veth_peer: string = "veth-c"
-    let ip_addr: string = "10.10.0." + to_string(suffix)
-
-    proc::run("ip", ["link", "del", veth_host]) ;; remove stale veth from a crashed run
-
-    let created: proc::RunResult = proc::run("ip",
-        ["link", "add", veth_host, "type", "veth", "peer", "name", veth_peer])
-    if created.exit_code != 0 is return nil end
-
-    let attached: proc::RunResult = proc::run("ip", ["link", "set", veth_host, "master", bridge])
-    if attached.exit_code != 0 is return nil end
-
-    let brought_up: proc::RunResult = proc::run("ip", ["link", "set", veth_host, "up"])
-    if brought_up.exit_code != 0 is return nil end
-
-    let moved: proc::RunResult = proc::run("ip", ["link", "set", veth_peer, "netns", to_string(pid)])
-    if moved.exit_code != 0 is return nil end
-
-    log::info("veth pair created: ip=" + ip_addr + " veth=" + veth_host)
-    return (ip_addr, veth_host)
-end
-
-;; Called inside the child process, after entering the new network namespace.
-pub fn setup_container_interface(ip_addr: string, gateway: string) is
-    proc::run("ip", ["link", "set", "lo", "up"])
-    proc::run("ip", ["link", "set", "veth-c", "name", "eth0"])
-    proc::run("ip", ["addr", "add", ip_addr + "/24", "dev", "eth0"])
-    proc::run("ip", ["link", "set", "eth0", "up"])
-    proc::run("ip", ["route", "add", "default", "via", gateway])
-end
-
-struct PortRule is
-    host_port:      string
-    container_port: string
-    proto:          string
-end
-
-fn parse_port_rule(rule: string) -> PortRule? is
-    let parts: [string] = str::splitn(rule, ":", 2)
-    if array_len(parts) != 2 is return nil end
-    let host_port: string = parts[0]
-    let slash: int = str::find(parts[1], "/")
-    if slash >= 0 is
-        return PortRule { host_port: host_port,
-                           container_port: str::slice(parts[1], 0, slash),
-                           proto: str::to_lower(str::slice(parts[1], slash + 1, str::len(parts[1]))) }
+    if sub == "attach" || sub == "detach" is
+        if array_len(argv) != 3 is return ui::fail("usage: hco network " + sub + " NETWORK CONTAINER") end
+        return cni::attach(s, argv[1], argv[2], sub == "detach")
     end
-    return PortRule { host_port: host_port, container_port: parts[1], proto: "tcp" }
+    ui::error("unknown network command: " + sub)
+    return usage()
 end
 
-pub fn setup_port_forwarding(rules: [string], container_ip: string) -> bool is
-    for rule_str in rules is
-        let maybe_rule: PortRule? = parse_port_rule(rule_str)
-        if maybe_rule == nil is
-            log::error("Invalid port rule '" + rule_str + "': expected host:container")
-            return false
-        end
-        let rule: PortRule = maybe_rule
-        let dest: string = container_ip + ":" + rule.container_port
-
-        let check: proc::RunResult = proc::run("iptables",
-            ["-t", "nat", "-C", "PREROUTING", "-p", rule.proto, "--dport", rule.host_port, "-j", "DNAT", "--to-destination", dest])
-        if check.exit_code != 0 is
-            let added: proc::RunResult = proc::run("iptables",
-                ["-t", "nat", "-A", "PREROUTING", "-p", rule.proto, "--dport", rule.host_port, "-j", "DNAT", "--to-destination", dest])
-            if added.exit_code != 0 is
-                log::error("Failed to add port rule " + rule_str)
-                return false
-            end
-            log::info("Port forwarding rule added: " + rule_str)
-        end
-
-        let fwd_check: proc::RunResult = proc::run("iptables",
-            ["-C", "FORWARD", "-d", container_ip, "-p", rule.proto, "--dport", rule.container_port, "-j", "ACCEPT"])
-        if fwd_check.exit_code != 0 is
-            proc::run("iptables", ["-A", "FORWARD", "-d", container_ip, "-p", rule.proto, "--dport", rule.container_port, "-j", "ACCEPT"])
-        end
+;; hco port CONTAINER — published ports.
+pub fn cmd_port(s: ctr::store::Store, argv: [string]) -> int is
+    if array_len(argv) != 1 is return ui::fail("usage: hco port CONTAINER") end
+    let id: string = backend::resolve(s, argv[0])
+    if id == "" is return 1 end
+    let ports: string = utils::kv_get(s.st_root + "/containers/" + id + "/state", "publish")
+    if ports == "" is
+        ui::info("no published ports")
+        return 0
     end
-    return true
-end
-
-pub fn cleanup_port_forwarding(rules: [string], container_ip: string) is
-    for rule_str in rules is
-        let maybe_rule: PortRule? = parse_port_rule(rule_str)
-        if maybe_rule == nil is
-            ;; [FIXED] previously silent — see module doc comment.
-            log::warn("Cannot parse port rule during cleanup, skipping: '" + rule_str + "'")
-            continue
-        end
-        let rule: PortRule = maybe_rule
-        let dest: string = container_ip + ":" + rule.container_port
-        proc::run("iptables", ["-t", "nat", "-D", "PREROUTING", "-p", rule.proto, "--dport", rule.host_port, "-j", "DNAT", "--to-destination", dest])
-        proc::run("iptables", ["-D", "FORWARD", "-d", container_ip, "-p", rule.proto, "--dport", rule.container_port, "-j", "ACCEPT"])
+    let specs: [string] = string_split(ports, ",")
+    let mut i: int = 0
+    while i < array_len(specs) is
+        write("  " + colors::bold(specs[i]))
+        i += 1
     end
-end
-
-;; ── CNI-managed networking (delegates the actual work to cni.h#) ───────────────
-
-pub fn setup_cni(network_name: string, container_id: string) -> bool is
-    let netns_path: string = "/var/run/netns/" + container_id
-    if !fs::exists(netns_path) is
-        let created: proc::RunResult = proc::run("ip", ["netns", "add", container_id])
-        if created.exit_code != 0 is return false end
-    end
-    let ip: string? = cni::cni_add(network_name, container_id, netns_path)
-    return ip != nil
-end
-
-pub fn cleanup_cni(network_name: string, container_id: string) is
-    let netns_path: string = "/var/run/netns/" + container_id
-    cni::cni_del(network_name, container_id, netns_path)
-    proc::run("ip", ["netns", "del", container_id])
+    return 0
 end
