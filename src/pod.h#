@@ -1,143 +1,166 @@
-use "std -> uuid" from "uuid"
-use "std -> time" from "time"
-use "std -> log" from "log"
-use "std -> json" from "json"
+use "bit -> container" from "ctr"
+use "bit -> colors"
 
+mod utils
+mod ui
+mod args
+mod backend
 mod db
-mod container
 mod validation
-mod network
 mod sandbox
 
-pub struct PodCreateOptions is
-    pub name:           string
-    pub shared_network: bool
-    pub shared_pid:     bool
-    pub shared_ipc:     bool
-    pub cni_network:    string
+fn usage() -> int is
+    ui::title("hco pod")
+    ui::help_cmd("create", "NAME [opts]", "new pod (--network --memory --cpus --restart --preset)")
+    ui::help_cmd("ls", "", "list pods")
+    ui::help_cmd("inspect", "NAME", "show pod defaults and members")
+    ui::help_cmd("start", "NAME", "start every member")
+    ui::help_cmd("stop", "NAME", "stop every member")
+    ui::help_cmd("restart", "NAME", "restart every member")
+    ui::help_cmd("rm", "NAME [-f]", "remove the pod (-f also removes members)")
+    ui::hint("run a member with: hco run --pod NAME IMAGE")
+    return 0
 end
 
-pub struct OpError is
-    pub message: string
+fn create(s: ctr::store::Store, argv: [string]) -> int is
+    let p = args::parse(argv, ["--network", "--memory", "--cpus", "--restart", "--preset"], false)
+    let name: string = args::pos_at(p, 0)
+    let bad: string = validation::name(name)
+    if bad != "" is return ui::fail("pod name: " + bad) end
+    if db::pod_exists(s, name) is return ui::fail("pod " + name + " already exists") end
+    let net: string = args::get(p, ["--network"])
+    if net != "" && validation::network_mode(net) != "" is return ui::fail(validation::network_mode(net)) end
+    let mem: string = args::get(p, ["--memory"])
+    if mem != "" && validation::memory(mem) != "" is return ui::fail(validation::memory(mem)) end
+    let pol: string = args::get(p, ["--restart"])
+    if pol != "" && validation::restart_policy(pol) != "" is return ui::fail(validation::restart_policy(pol)) end
+    let pre: string = args::get(p, ["--preset"])
+    if pre != "" && !sandbox::known(pre) is return ui::fail("unknown preset " + pre) end
+    db::pod_set(s, name, "created", to_string(utils::now_unix()))
+    if net != "" is db::pod_set(s, name, "network", net) end
+    if mem != "" is db::pod_set(s, name, "memory", mem) end
+    if args::get(p, ["--cpus"]) != "" is db::pod_set(s, name, "cpus", args::get(p, ["--cpus"])) end
+    if pol != "" is db::pod_set(s, name, "restart", pol) end
+    if pre != "" is db::pod_set(s, name, "preset", pre) end
+    db::event(s, "pod", name, "create")
+    ui::success("pod " + colors::bold(name) + " created")
+    ui::hint("add containers with: hco run -d --pod " + name + " IMAGE")
+    return 0
 end
 
-pub fn op_err(msg: string) -> OpError is
-    return OpError { message: msg }
-end
-
-pub fn op_error_message(e: OpError) -> string is return e.message end
-
-
-pub fn create_pod(opts: PodCreateOptions) -> (string, OpError?) is
-    let name_err: validation::ValidationError? = validation::validate_name(opts.name)
-    if name_err != nil is return ("", op_err(validation::validation_error_message(name_err))) end
-
-    if db::find_pod(opts.name) != nil is
-        return ("", op_err("A pod named '" + opts.name + "' already exists"))
+fn ls(s: ctr::store::Store) -> int is
+    let pods: [string] = db::pod_names(s)
+    if array_len(pods) == 0 is
+        ui::info("no pods")
+        ui::hint("create one with: hco pod create NAME")
+        return 0
     end
-
-    ;; "pause" container: an infinitely-sleeping minimal container that
-    ;; owns the shared namespaces for the pod's lifetime, same trick
-    ;; Kubernetes' CRI implementations use.
-    let pause_opts: container::CreateOptions = container::CreateOptions {
-        name: opts.name + "-pause", image_ref: "hco/pause:latest", mounts: [], ports: [],
-        env: [], memory_limit: "16MB", cpu_percent: 0, cni_network: opts.cni_network,
-        rootless: false, readonly_root: true, auto_restart: true, seccomp: "", pod_id: opts.name
-    }
-    let created: (string, container::OpError?) = container::create_container(pause_opts)
-    if created.1 != nil is return ("", op_err("Failed to create pause container: " + container::op_error_message(created.1))) end
-
-    let netns_path: string = if opts.shared_network then "/proc/" + created.0 + "/ns/net" else ""
-
-    let row: db::PodRow = db::PodRow {
-        name: opts.name, container_ids_json: json::stringify_string_array([created.0]),
-        status: "Running", shared_network: opts.shared_network, shared_pid: opts.shared_pid,
-        shared_ipc: opts.shared_ipc, netns_path: netns_path, spec_json: "{}", created_at: time::now_rfc3339()
-    }
-    db::insert_pod(row)
-    log::info("Pod '" + opts.name + "' created with pause container " + created.0)
-    return (opts.name, nil)
-end
-
-pub fn add_container_to_pod(pod_name: string, container_id: string) -> OpError? is
-    let row: db::PodRow? = db::find_pod(pod_name)
-    if row == nil is return op_err("No such pod: " + pod_name) end
-    let ids: [string] = db::pod_container_ids(row)
-    let updated: [string] = array_push(ids, container_id)
-    db::insert_pod(db::PodRow {
-        name: db::pod_row_name(row), container_ids_json: json::stringify_string_array(updated),
-        status: db::pod_row_status(row), shared_network: db::pod_row_shared_network(row), shared_pid: db::pod_row_shared_pid(row),
-        shared_ipc: db::pod_row_shared_ipc(row), netns_path: db::pod_row_netns_path(row), spec_json: db::pod_row_spec_json(row),
-        created_at: db::pod_row_created_at(row)
-    })
-    return nil
-end
-
-pub fn stop_pod(pod_name: string) -> OpError? is
-    let row: db::PodRow? = db::find_pod(pod_name)
-    if row == nil is return op_err("No such pod: " + pod_name) end
-    let ids: [string] = db::pod_container_ids(row)
-    let row_name: string = db::pod_row_name(row)
-    let row_netns_path: string = db::pod_row_netns_path(row)
-
-    ;; [FIXED] collect per-container failures instead of assuming success.
-    let mut failures: [string] = []
-    for cid in ids is
-        let result: container::OpError? = container::stop_container(cid, 5000)
-        if result != nil is
-            failures = array_push(failures, cid + ": " + container::op_error_message(result))
+    let mut t = ui::table(["POD", "CONTAINERS", "RUNNING", "NETWORK", "MEMORY", "RESTART", "PRESET"])
+    let mut i: int = 0
+    while i < array_len(pods) is
+        let m: [string] = db::pod_members(s, pods[i])
+        let mut up: int = 0
+        let mut k: int = 0
+        while k < array_len(m) is
+            if backend::is_running(s, m[k]) is up += 1 end
+            k += 1
         end
+        t = ui::add_row(t, [colors::bold(pods[i]), to_string(array_len(m)), if up > 0 then colors::fg::limegreen(to_string(up)) else ui::muted("0") end, utils::or_default(db::pod_get(s, pods[i], "network"), "bridge"), utils::or_default(db::pod_get(s, pods[i], "memory"), "—"), utils::or_default(db::pod_get(s, pods[i], "restart"), "no"), utils::or_default(db::pod_get(s, pods[i], "preset"), "—")])
+        i += 1
     end
-
-    if row_netns_path != "" is
-        network::cleanup_cni(row_name, row_name)
-    end
-
-    if array_len(failures) > 0 is
-        return op_err("Some containers in pod '" + pod_name + "' failed to stop: " + str_join_semicolons(failures))
-    end
-
-    db::insert_pod(db::PodRow {
-        name: row_name, container_ids_json: db::pod_row_container_ids_json(row), status: "Stopped",
-        shared_network: db::pod_row_shared_network(row), shared_pid: db::pod_row_shared_pid(row), shared_ipc: db::pod_row_shared_ipc(row),
-        netns_path: row_netns_path, spec_json: db::pod_row_spec_json(row), created_at: db::pod_row_created_at(row)
-    })
-    log::info("Pod '" + pod_name + "' stopped")
-    return nil
+    ui::print_table(t)
+    return 0
 end
 
-fn str_join_semicolons(items: [string]) -> string is
-    let mut out: string = ""
-    let mut first: bool = true
-    for i in items is
-        if !first is out += "; " end
-        out += i
-        first = false
+fn inspect(s: ctr::store::Store, name: string) -> int is
+    if !db::pod_exists(s, name) is return ui::fail("no such pod: " + name) end
+    ui::title("pod " + name)
+    ui::kv("Network", utils::or_default(db::pod_get(s, name, "network"), "bridge"))
+    ui::kv("Memory", utils::or_default(db::pod_get(s, name, "memory"), "—"))
+    ui::kv("CPUs", utils::or_default(db::pod_get(s, name, "cpus"), "—"))
+    ui::kv("Restart", utils::or_default(db::pod_get(s, name, "restart"), "no"))
+    ui::kv("Preset", utils::or_default(db::pod_get(s, name, "preset"), "—"))
+    let m: [string] = db::pod_members(s, name)
+    ui::section("Members")
+    if array_len(m) == 0 is
+        ui::out(ui::muted("  (none)"))
+        return 0
     end
-    return out
+    let mut i: int = 0
+    while i < array_len(m) is
+        write("  " + colors::util::pad_right(colors::bold(backend::name_of(s, m[i])), 24) + ui::status_badge(ctr::container_status(s, m[i])))
+        i += 1
+    end
+    return 0
 end
 
-pub fn remove_pod(pod_name: string, force: bool) -> OpError? is
-    let row: db::PodRow? = db::find_pod(pod_name)
-    if row == nil is return op_err("No such pod: " + pod_name) end
-
-    if db::pod_row_status(row) == "Running" is
-        if !force is return op_err("Pod '" + pod_name + "' is running; use --force to remove") end
-        stop_pod(pod_name)
+fn each_member(s: ctr::store::Store, name: string, act: string) -> int is
+    if !db::pod_exists(s, name) is return ui::fail("no such pod: " + name) end
+    let m: [string] = db::pod_members(s, name)
+    if array_len(m) == 0 is
+        ui::info("pod " + name + " has no containers")
+        return 0
     end
-
-    for cid in db::pod_container_ids(row) is
-        container::remove_container(cid, true)
+    let mut failed: int = 0
+    let mut i: int = 0
+    while i < array_len(m) is
+        let mut good: bool = false
+        if act == "start" is
+            good = ctr::container_start(s, m[i], false) == 0
+            if good is db::meta_set(s, m[i], "user_stopped", "0") end
+        else if act == "stop" is
+            good = ctr::container_stop(s, m[i], 10)
+            if good is db::meta_set(s, m[i], "user_stopped", "1") end
+        else is
+            ctr::container_stop(s, m[i], 10)
+            good = ctr::container_start(s, m[i], false) == 0
+        end
+        if good is
+            ui::success(act + " " + colors::bold(backend::name_of(s, m[i])) + " " + ui::muted("[" + name + "]"))
+        else is
+            ui::error("cannot " + act + " " + backend::name_of(s, m[i]))
+            failed += 1
+        end
+        i += 1
     end
-    db::delete_pod(pod_name)
-    log::info("Pod '" + pod_name + "' removed")
-    return nil
+    db::event(s, "pod", name, act)
+    if failed > 0 is return 1 end
+    return 0
 end
 
-pub fn list_pods(page: int, per_page: int) -> ([db::PodRow], int) is
-    return db::list_pods_paged(page, per_page)
+fn remove(s: ctr::store::Store, argv: [string]) -> int is
+    let p = args::parse(argv, [], false)
+    let name: string = args::pos_at(p, 0)
+    if !db::pod_exists(s, name) is return ui::fail("no such pod: " + name) end
+    let m: [string] = db::pod_members(s, name)
+    if array_len(m) > 0 && !args::flag(p, ["-f", "--force"]) is
+        return ui::fail_hint("pod " + name + " still has " + to_string(array_len(m)) + " container(s)", "use -f to remove them too")
+    end
+    let mut i: int = 0
+    while i < array_len(m) is
+        ctr::container_remove(s, m[i], true)
+        db::meta_drop(s, m[i])
+        i += 1
+    end
+    db::pod_drop(s, name)
+    db::event(s, "pod", name, "remove")
+    ui::success("pod " + colors::bold(name) + " removed")
+    return 0
 end
 
-pub fn inspect_pod(pod_name: string) -> db::PodRow? is
-    return db::find_pod(pod_name)
+;; hco pod <subcommand> ...
+pub fn cmd_pod(s: ctr::store::Store, argv: [string]) -> int is
+    if array_len(argv) == 0 is return usage() end
+    let sub: string = argv[0]
+    let rest: [string] = args::argv_tail(argv, 1)
+    if sub == "create" || sub == "new" is return create(s, rest) end
+    if sub == "ls" || sub == "list" || sub == "ps" is return ls(s) end
+    if sub == "inspect" is return inspect(s, if array_len(rest) > 0 then rest[0] else "" end) end
+    if sub == "start" || sub == "stop" || sub == "restart" is
+        if array_len(rest) != 1 is return ui::fail("usage: hco pod " + sub + " NAME") end
+        return each_member(s, rest[0], sub)
+    end
+    if sub == "rm" || sub == "remove" is return remove(s, rest) end
+    ui::error("unknown pod command: " + sub)
+    return usage()
 end
