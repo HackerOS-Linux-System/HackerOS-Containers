@@ -1,291 +1,519 @@
-use "std -> uuid" from "uuid"
-use "std -> time" from "time"
-use "std -> log" from "log"
-use "std -> json" from "json"
-use "std -> fs" from "fs"
-use "std -> strings" from "str"
+use "bit -> container" from "ctr"
+use "bit -> colors"
 
-mod config
-mod validation
-mod db
-mod image
-mod sandbox
-mod sys_ffi
-mod network
-mod logging
-mod metrics
 mod utils
+mod ui
+mod args
+mod backend
+mod db
+mod validation
+mod sandbox
 
-const GRACE_PERIOD_MS: int = 5000
-const POLL_INTERVAL_MS: int = 100
-const LOG_ROOT: string = "/var/log/hco/containers"
-
-pub struct CreateOptions is
-    pub name:          string
-    pub image_ref:     string
-    pub mounts:        [string]
-    pub ports:         [string]
-    pub env:           [string]
-    pub memory_limit:  string
-    pub cpu_percent:   int
-    pub cni_network:   string ;; "" == bridge mode
-    pub rootless:      bool
-    pub readonly_root: bool
-    pub auto_restart:  bool
-    pub seccomp:       string
-    pub pod_id:        string ;; "" == none
+pub fn run_valued() -> [string] is
+    return ["--name", "--hostname", "-h", "-w", "--workdir", "-u", "--user", "--network", "--net", "-m", "--memory", "--cpus", "--pids-limit", "--cpu-shares", "-e", "--env", "-v", "--volume", "-p", "--publish", "--entrypoint", "--cap-add", "--cap-drop", "-l", "--label", "--restart", "--pod", "--preset", "--seccomp", "--health-cmd", "--health-interval", "--env-file", "--rootfs"]
 end
 
-pub struct OpError is
-    pub message: string
+;; Validates every flag of `run` / `create`; returns "" or the first problem.
+fn check_flags(p: args::Parsed) -> string is
+    let nm: string = args::get(p, ["--name"])
+    if nm != "" is
+        let bad: string = validation::name(nm)
+        if bad != "" is return "--name: " + bad end
+    end
+    let net: string = utils::or_default(args::get(p, ["--network", "--net"]), "bridge")
+    let nbad: string = validation::network_mode(net)
+    if nbad != "" is return "--network: " + nbad end
+    let mem: string = args::get(p, ["-m", "--memory"])
+    if mem != "" is
+        let b: string = validation::memory(mem)
+        if b != "" is return "--memory: " + b end
+    end
+    let cpus: string = args::get(p, ["--cpus"])
+    if cpus != "" is
+        let b2: string = validation::cpus(cpus)
+        if b2 != "" is return "--cpus: " + b2 end
+    end
+    let ports: [string] = args::all(p, ["-p", "--publish"])
+    let mut i: int = 0
+    while i < array_len(ports) is
+        let b3: string = validation::publish(ports[i])
+        if b3 != "" is return "--publish: " + b3 end
+        i += 1
+    end
+    let vols: [string] = args::all(p, ["-v", "--volume"])
+    let mut j: int = 0
+    while j < array_len(vols) is
+        let b4: string = validation::volume(vols[j])
+        if b4 != "" is return "--volume: " + b4 end
+        j += 1
+    end
+    let envs: [string] = args::all(p, ["-e", "--env"])
+    let mut k: int = 0
+    while k < array_len(envs) is
+        let b5: string = validation::env_pair(envs[k])
+        if b5 != "" is return "--env: " + b5 end
+        k += 1
+    end
+    let pol: string = args::get(p, ["--restart"])
+    if pol != "" is
+        let b6: string = validation::restart_policy(pol)
+        if b6 != "" is return b6 end
+    end
+    let pre: string = args::get(p, ["--preset"])
+    if pre != "" && !sandbox::known(pre) is return "unknown preset '" + pre + "' (see: hco preset ls)" end
+    return ""
 end
 
-pub fn op_error_message(e: OpError) -> string is return e.message end
-
-
-fn op_err(msg: string) -> OpError is
-    return OpError { message: msg }
-end
-
-pub fn create_container(opts: CreateOptions) -> (string, OpError?) is
-    let name_err: validation::ValidationError? = validation::validate_name(opts.name)
-    if name_err != nil is return ("", op_err(validation::validation_error_message(name_err))) end
-
-    let image_err: validation::ValidationError? = validation::validate_image_ref(opts.image_ref)
-    if image_err != nil is return ("", op_err(validation::validation_error_message(image_err))) end
-
-    for m in opts.mounts is
-        let spec: validation::MountSpec = validation::validate_mount(m)
-        if spec.error != "" is return ("", op_err(spec.error)) end
+;; Creates a container from parsed `run` flags: positional 0 is the image,
+;; the rest the command. Returns the container id, or "" after printing why.
+pub fn create_from(s: ctr::store::Store, p: args::Parsed, quiet_out: bool) -> string is
+    let image: string = args::pos_at(p, 0)
+    let ibad: string = validation::image_ref(image)
+    if ibad != "" is
+        ui::error(ibad)
+        ui::hint("usage: hco run [options] IMAGE [COMMAND...]")
+        return ""
     end
-    for p in opts.ports is
-        let perr: validation::ValidationError? = validation::validate_port_mapping(p)
-        if perr != nil is return ("", op_err(validation::validation_error_message(perr))) end
+    let fbad: string = check_flags(p)
+    if fbad != "" is
+        ui::error(fbad)
+        return ""
     end
-    for e in opts.env is
-        let eerr: validation::ValidationError? = validation::validate_env_var(e)
-        if eerr != nil is return ("", op_err(validation::validation_error_message(eerr))) end
+    let pod: string = args::get(p, ["--pod"])
+    if pod != "" && !db::pod_exists(s, pod) is
+        ui::error("no such pod: " + pod)
+        ui::hint("create it first: hco pod create " + pod)
+        return ""
     end
-    if opts.memory_limit != "" is
-        let merr: validation::ValidationError? = validation::validate_memory_limit(opts.memory_limit)
-        if merr != nil is return ("", op_err(validation::validation_error_message(merr))) end
-    end
-    if opts.cpu_percent != 0 is
-        let cerr: validation::ValidationError? = validation::validate_cpu_percent(opts.cpu_percent)
-        if cerr != nil is return ("", op_err(validation::validation_error_message(cerr))) end
-    end
-
-    if db::find_container(opts.name) != nil is
-        return ("", op_err("A container named '" + opts.name + "' already exists"))
-    end
-
-    let container_id: string = uuid::v4()
-    let image_ref: image::ImageRef = image::parse_image_ref(opts.image_ref)
-    let bundle_path: string? = image::create_bundle(container_id, image_ref)
-    if bundle_path == nil is return ("", op_err("Failed to prepare image bundle for " + opts.image_ref)) end
-
-    let cfg: config::HkConfig = config::create_ephemeral(opts.name, opts.image_ref, opts.mounts, opts.ports)
-
-    let pid: int? = spawn_sandboxed(container_id, bundle_path, opts, cfg)
-    if pid == nil is
-        image::destroy_bundle(container_id)
-        return ("", op_err("Failed to start container process"))
-    end
-
-    let mut ip_address: string = ""
-    let mut veth_host: string = ""
-
-    if opts.cni_network != "" is
-        if !network::setup_cni(opts.cni_network, container_id) is
-            log::warn("CNI network setup failed for " + container_id + ", continuing without networking")
+    if !ctr::image_exists(s, image) is
+        if !quiet_out is ui::step(1, 2, "image " + colors::bold(image) + " not present, pulling") end
+        if ctr::image_pull(s, image) == "" is
+            ui::error("cannot pull " + image)
+            return ""
         end
-    else is
-        let allocated: string? = db::ipam_allocate(container_id, "10.10.0")
-        if allocated != nil is
-            let veth: (string, string)? = network::create_veth_pair(pid, conv::str_to_int(str_last_octet(allocated)))
-            if veth != nil is
-                ip_address = veth.0
-                veth_host = veth.1
-                network::setup_port_forwarding(opts.ports, ip_address)
+    end
+
+    let mut o = ctr::container_options(image)
+    ;; pod defaults first, so explicit flags below win
+    if pod != "" is
+        let keys: [string] = ["network", "memory", "cpus"]
+        let mut ki: int = 0
+        while ki < array_len(keys) is
+            let v: string = db::pod_get(s, pod, keys[ki])
+            if v != "" is o = ctr::set_option(o, keys[ki], v) end
+            ki += 1
+        end
+    end
+    let mut pre: string = args::get(p, ["--preset"])
+    if pre == "" && args::flag(p, ["--hardened"]) is pre = "hardened" end
+    if pre == "" && pod != "" is pre = db::pod_get(s, pod, "preset") end
+    if pre != "" is
+        let items: [string] = sandbox::preset(pre)
+        let mut pi: int = 0
+        while pi < array_len(items) is
+            let it: string = items[pi]
+            if string_starts_with(it, "+") is
+                o = ctr::add_option(o, utils::head_before(string_slice(it, 1, string_len(it)), "="), utils::tail_after(it, "="))
+            else is
+                o = ctr::set_option(o, utils::head_before(it, "="), utils::tail_after(it, "="))
+            end
+            pi += 1
+        end
+    end
+
+    let singles: [string] = ["--name|name", "--hostname|hostname", "-h|hostname", "-w|workdir", "--workdir|workdir", "-u|user", "--user|user", "--network|network", "--net|network", "-m|memory", "--memory|memory", "--cpus|cpus", "--pids-limit|pids", "--cpu-shares|shares", "--rootfs|rootfs_dir"]
+    let mut si: int = 0
+    while si < array_len(singles) is
+        let flag_name: string = utils::head_before(singles[si], "|")
+        let key: string = utils::tail_after(singles[si], "|")
+        let v2: string = args::get(p, [flag_name])
+        if v2 != "" is o = ctr::set_option(o, key, v2) end
+        si += 1
+    end
+    if args::flag(p, ["--read-only"]) is o = ctr::set_option(o, "readonly", "true") end
+    if args::flag(p, ["--privileged"]) is o = ctr::set_option(o, "privileged", "true") end
+    if args::flag(p, ["--rm"]) is o = ctr::set_option(o, "rm", "true") end
+    if args::flag(p, ["-d", "--detach"]) is o = ctr::set_option(o, "detach", "true") end
+
+    let repeat: [string] = ["-e|env", "--env|env", "-v|volume", "--volume|volume", "-p|publish", "--publish|publish", "--entrypoint|entrypoint", "--cap-add|cap_add", "--cap-drop|cap_drop", "-l|label", "--label|label"]
+    let mut ri: int = 0
+    while ri < array_len(repeat) is
+        let rf: string = utils::head_before(repeat[ri], "|")
+        let rk: string = utils::tail_after(repeat[ri], "|")
+        let vals: [string] = args::all(p, [rf])
+        let mut vi: int = 0
+        while vi < array_len(vals) is
+            o = ctr::add_option(o, rk, vals[vi])
+            vi += 1
+        end
+        ri += 1
+    end
+    let envf: string = args::get(p, ["--env-file"])
+    if envf != "" is
+        if !file_exists(envf) is
+            ui::error("env file not found: " + envf)
+            return ""
+        end
+        let el: [string] = utils::lines(utils::read(envf))
+        let mut ei: int = 0
+        while ei < array_len(el) is
+            if !string_starts_with(el[ei], "#") && string_find(el[ei], "=") > 0 is o = ctr::add_option(o, "env", el[ei]) end
+            ei += 1
+        end
+    end
+    o = ctr::set_command(o, args::rest_from(p, 1))
+
+    let id: string = ctr::container_create(s, o)
+    if id == "" is
+        ui::error("the library could not create the container")
+        ui::hint("check the host with: hco doctor")
+        return ""
+    end
+    let mut policy: string = args::get(p, ["--restart"])
+    if policy == "" && pod != "" is policy = db::pod_get(s, pod, "restart") end
+    db::meta_set(s, id, "policy", utils::or_default(policy, "no"))
+    db::meta_set(s, id, "image", image)
+    db::meta_set(s, id, "created", to_string(utils::now_unix()))
+    if pod != "" is db::meta_set(s, id, "pod", pod) end
+    if pre != "" is db::meta_set(s, id, "preset", pre) end
+    let sec: string = args::get(p, ["--seccomp"])
+    if sec != "" is db::meta_set(s, id, "seccomp", sec) end
+    let hc: string = args::get(p, ["--health-cmd"])
+    if hc != "" is
+        db::meta_set(s, id, "health_cmd", hc)
+        db::meta_set(s, id, "health_interval", utils::or_default(args::get(p, ["--health-interval"]), "30"))
+    end
+    db::event(s, "container", utils::short_id(id), "create " + image)
+    return id
+end
+
+;; hco run [options] IMAGE [COMMAND...]
+pub fn cmd_run(s: ctr::store::Store, argv: [string]) -> int is
+    let p = args::parse(argv, run_valued(), true)
+    let detach: bool = args::flag(p, ["-d", "--detach"])
+    let id: string = create_from(s, p, detach)
+    if id == "" is return 1 end
+    db::event(s, "container", utils::short_id(id), "start")
+    if detach is
+        let rc: int = ctr::container_start(s, id, false)
+        if rc != 0 is return ui::fail("container " + utils::short_id(id) + " did not start (see: hco logs " + utils::short_id(id) + ")") end
+        write(utils::short_id(id))
+        return 0
+    end
+    let code: int = ctr::container_start(s, id, true)
+    db::event(s, "container", utils::short_id(id), "exit " + to_string(code))
+    return code
+end
+
+;; hco create [options] IMAGE [COMMAND...]
+pub fn cmd_create(s: ctr::store::Store, argv: [string]) -> int is
+    let p = args::parse(argv, run_valued(), true)
+    let id: string = create_from(s, p, false)
+    if id == "" is return 1 end
+    write(utils::short_id(id))
+    return 0
+end
+
+;; Runs `act` over every named container. act: start|stop|restart|kill|rm
+fn each(s: ctr::store::Store, names: [string], act: string, timeout: int, sig: string, force: bool) -> int is
+    if array_len(names) == 0 is return ui::fail("usage: hco " + act + " CONTAINER...") end
+    let mut failed: int = 0
+    let mut i: int = 0
+    while i < array_len(names) is
+        let id: string = backend::resolve(s, names[i])
+        if id == "" is
+            failed += 1
+        else is
+            let label: string = utils::short_id(id)
+            let mut good: bool = false
+            if act == "start" is
+                good = ctr::container_start(s, id, false) == 0
+            else if act == "stop" is
+                good = ctr::container_stop(s, id, timeout)
+            else if act == "restart" is
+                ctr::container_stop(s, id, timeout)
+                good = ctr::container_start(s, id, false) == 0
+            else if act == "kill" is
+                good = ctr::container_kill(s, id, sig)
+            else is
+                good = ctr::container_remove(s, id, force)
+                if good is db::meta_drop(s, id) end
+            end
+            if good && (act == "stop" || act == "kill") is db::meta_set(s, id, "user_stopped", "1") end
+            if good && (act == "start" || act == "restart") is db::meta_set(s, id, "user_stopped", "0") end
+            if good is
+                ui::success(act + " " + colors::bold(utils::or_default(names[i], label)) + " " + colors::theme::muted(label))
+                db::event(s, "container", label, act)
+            else is
+                ui::error("cannot " + act + " " + names[i])
+                failed += 1
             end
         end
+        i += 1
     end
-
-    let row: db::ContainerRow = db::ContainerRow {
-        id: container_id, name: opts.name, image: opts.image_ref, pid: pid,
-        status: "Running", ip_address: ip_address, veth_host: veth_host,
-        bundle_path: bundle_path, ports_json: json::stringify_string_array(opts.ports),
-        pod_id: opts.pod_id, auto_restart: opts.auto_restart,
-        config_json: config::config_to_json(cfg), created_at: time::now_rfc3339()
-    }
-    db::insert_container(row)
-    log::info("Container '" + opts.name + "' created (" + container_id + "), pid=" + to_string(pid))
-    return (container_id, nil)
+    if failed > 0 is return 1 end
+    return 0
 end
 
-fn str_last_octet(ip: string) -> string is
-    let parts: [string] = str::split(ip, ".")
-    return parts[array_len(parts) - 1]
+pub fn cmd_start(s: ctr::store::Store, argv: [string]) -> int is
+    return each(s, argv, "start", 10, "TERM", false)
 end
 
-;; Fork + unshare + exec — mirrors the Rust version's use of
-;; `nix::unistd::fork` followed by `nix::sched::unshare` in the child.
-fn spawn_sandboxed(container_id: string, bundle_path: string, opts: CreateOptions, cfg: config::HkConfig) -> int? is
-    let child_pid: int = sys_ffi::fork_raw()
-    if child_pid < 0 is return nil end
-
-    if child_pid == 0 is
-        ;; ── child process ──
-        if !sandbox::unshare_namespaces(opts.rootless) is sys_ffi::kill_raw(sys_ffi::current_pid(), 9) end
-
-        let spec: sandbox::SandboxSpec = sandbox::SandboxSpec {
-            bundle_path: bundle_path,
-            memory_limit: if opts.memory_limit != "" then utils::parse_bytes(opts.memory_limit) else 0,
-            cpu_percent: opts.cpu_percent,
-            readonly_root: opts.readonly_root,
-            drop_caps: config::cfg_drop_caps(cfg),
-            rootless: opts.rootless,
-            seccomp_profile: opts.seccomp,
-            hostname: opts.name
-        }
-        sandbox::enter(container_id, sys_ffi::current_pid(), spec)
-
-        let cfg_cmd: [string] = config::cfg_cmd(cfg)
-        let argv: [string] = if array_len(cfg_cmd) > 0 then cfg_cmd else ["/bin/sh"]
-        sys_ffi::execve_raw(argv[0], str_join_space(argv), str_join_space(opts.env))
-        sys_ffi::kill_raw(sys_ffi::current_pid(), 9) ;; exec failed — die instead of falling through
-        return nil ;; unreachable
-    end
-
-    ;; ── parent process ──
-    return child_pid
+pub fn cmd_stop(s: ctr::store::Store, argv: [string]) -> int is
+    let p = args::parse(argv, ["-t", "--time"], false)
+    return each(s, args::pos(p), "stop", utils::atoi(utils::or_default(args::get(p, ["-t", "--time"]), "10")), "TERM", false)
 end
 
-fn str_join_space(items: [string]) -> string is
-    let mut out: string = ""
-    let mut first: bool = true
-    for i in items is
-        if !first is out += " " end
-        out += i
-        first = false
-    end
-    return out
+pub fn cmd_restart(s: ctr::store::Store, argv: [string]) -> int is
+    let p = args::parse(argv, ["-t", "--time"], false)
+    return each(s, args::pos(p), "restart", utils::atoi(utils::or_default(args::get(p, ["-t", "--time"]), "10")), "TERM", false)
 end
 
-pub fn stop_container(id_or_name: string, timeout_ms: int) -> OpError? is
-    let row: db::ContainerRow? = db::find_container(id_or_name)
-    if row == nil is return op_err("No such container: " + id_or_name) end
-    let c: db::ContainerRow = row
-    let c_pid: int = db::row_pid(c)
-    let c_id: string = db::row_id(c)
-    let c_name: string = db::row_name(c)
-    let c_ip: string = db::row_ip_address(c)
-    let c_pod_id: string = db::row_pod_id(c)
+pub fn cmd_kill(s: ctr::store::Store, argv: [string]) -> int is
+    let p = args::parse(argv, ["-s", "--signal"], false)
+    let sig: string = utils::or_default(args::get(p, ["-s", "--signal"]), "KILL")
+    let bad: string = validation::signal(sig)
+    if bad != "" is return ui::fail(bad) end
+    return each(s, args::pos(p), "kill", 0, sig, false)
+end
 
-    sys_ffi::signal_process(c_pid, sys_ffi::SIGTERM)
+pub fn cmd_rm(s: ctr::store::Store, argv: [string]) -> int is
+    let p = args::parse(argv, [], false)
+    return each(s, args::pos(p), "rm", 0, "", args::flag(p, ["-f", "--force"]))
+end
 
-    ;; [FIXED] adaptive polling instead of a fixed 5s sleep — see doc comment.
-    let grace: int = if timeout_ms > 0 then timeout_ms else GRACE_PERIOD_MS
-    let mut waited: int = 0
-    let mut exited: bool = false
-    while waited < grace is
-        if sys_ffi::try_reap(c_pid) is
-            exited = true
-            break
+;; ── ps ───────────────────────────────────────────────────────────────────────
+
+fn cmd_cell(c: string) -> string is
+    let t: string = if string_len(c) > 28 then string_slice(c, 0, 27) + "…" else c end
+    return colors::theme::muted(t)
+end
+
+;; hco ps [-a] [-q] [--pod NAME]
+pub fn cmd_ps(s: ctr::store::Store, argv: [string]) -> int is
+    let p = args::parse(argv, ["--pod", "--status"], false)
+    let all: bool = args::flag(p, ["-a", "--all"])
+    let pod: string = args::get(p, ["--pod"])
+    let want: string = args::get(p, ["--status"])
+    let list: [ctr::runtime::ContainerInfo] = ctr::container_list(s)
+    let mut t = ui::table(["ID", "NAME", "IMAGE", "STATUS", "POD", "IP", "COMMAND"])
+    let mut shown: int = 0
+    let mut i: int = 0
+    while i < array_len(list) is
+        let c: ctr::runtime::ContainerInfo = list[i]
+        let keep_state: bool = all || c.ci_status == "running"
+        let keep_pod: bool = pod == "" || db::meta_get(s, c.ci_id, "pod") == pod
+        let keep_status: bool = want == "" || c.ci_status == want
+        if keep_state && keep_pod && keep_status is
+            if args::flag(p, ["-q", "--quiet"]) is
+                write(utils::short_id(c.ci_id))
+            else is
+                let mut st: string = ui::status_badge(c.ci_status)
+                if c.ci_status == "exited" is st = st + colors::theme::muted(" (" + to_string(c.ci_exit) + ")") end
+                let podn: string = db::meta_get(s, c.ci_id, "pod")
+                t = ui::add_row(t, [colors::theme::code(utils::short_id(c.ci_id)), colors::bold(c.ci_name), c.ci_image, st, if podn == "" then ui::muted("—") else colors::fg::mediumpurple(podn) end, utils::or_default(c.ci_ip, "—"), cmd_cell(c.ci_command)])
+            end
+            shown += 1
         end
-        time::sleep_ms(POLL_INTERVAL_MS)
-        waited += POLL_INTERVAL_MS
+        i += 1
     end
-
-    if !exited is
-        sys_ffi::signal_process(c_pid, sys_ffi::SIGKILL)
-        sys_ffi::blocking_wait(c_pid)
+    if args::flag(p, ["-q", "--quiet"]) is return 0 end
+    if shown == 0 is
+        ui::info(if all then "no containers" else "no running containers" end)
+        if !all is ui::hint("show stopped ones too: hco ps -a") end
+        return 0
     end
+    ui::print_table(t)
+    return 0
+end
 
-    if c_ip != "" is
-        network::cleanup_port_forwarding(row_ports(c), c_ip)
+;; ── logs / exec / wait / inspect ─────────────────────────────────────────────
+
+;; hco logs [-f] [--tail N] CONTAINER
+pub fn cmd_logs(s: ctr::store::Store, argv: [string]) -> int is
+    let p = args::parse(argv, ["--tail", "-n"], false)
+    let id: string = backend::resolve(s, args::pos_at(p, 0))
+    if id == "" is return 1 end
+    let tail: int = utils::atoi(utils::or_default(args::get(p, ["--tail", "-n"]), "0"))
+    if args::flag(p, ["-f", "--follow"]) is
+        let n: int = if tail > 0 then tail else 50 end
+        return utils::run("tail -n " + to_string(n) + " -f " + utils::sq(s.st_root + "/containers/" + id + "/console.log"))
     end
-    if c_pod_id == "" is
-        sandbox::destroy_cgroup(c_id)
+    if tail > 0 is
+        write(ctr::container_logs_tail(s, id, tail))
+    else is
+        write(ctr::container_logs(s, id))
     end
-
-    db::update_container_status(c_id, "Stopped")
-    log::info("Container '" + c_name + "' stopped")
-    return nil
+    return 0
 end
 
-fn row_ports(c: db::ContainerRow) -> [string] is
-    return db::row_ports(c)
+;; hco exec [-e K=V] [-u USER] [-w DIR] CONTAINER COMMAND...
+pub fn cmd_exec(s: ctr::store::Store, argv: [string]) -> int is
+    let p = args::parse(argv, ["-e", "--env", "-u", "--user", "-w", "--workdir"], true)
+    let id: string = backend::resolve(s, args::pos_at(p, 0))
+    if id == "" is return 1 end
+    let cmd: [string] = args::rest_from(p, 1)
+    if array_len(cmd) == 0 is return ui::fail("usage: hco exec [options] CONTAINER COMMAND...") end
+    if !backend::is_running(s, id) is return ui::fail("container " + utils::short_id(id) + " is not running") end
+    return ctr::container_exec(s, id, cmd, args::all(p, ["-e", "--env"]), args::get(p, ["-u", "--user"]), args::get(p, ["-w", "--workdir"]))
 end
 
-pub fn remove_container(id_or_name: string, force: bool) -> OpError? is
-    let row: db::ContainerRow? = db::find_container(id_or_name)
-    if row == nil is return op_err("No such container: " + id_or_name) end
-    let c: db::ContainerRow = row
-    let c_id: string = db::row_id(c)
-    let c_name: string = db::row_name(c)
-    let c_ip: string = db::row_ip_address(c)
+pub fn cmd_wait(s: ctr::store::Store, argv: [string]) -> int is
+    let p = args::parse(argv, ["--timeout"], false)
+    let id: string = backend::resolve(s, args::pos_at(p, 0))
+    if id == "" is return 1 end
+    let code: int = ctr::container_wait(s, id, utils::atoi(utils::or_default(args::get(p, ["--timeout"]), "0")) * 1000)
+    write(to_string(code))
+    return 0
+end
 
-    if db::row_status(c) == "Running" is
-        if !force is return op_err("Container '" + c_name + "' is running; use --force to remove") end
-        stop_container(id_or_name, GRACE_PERIOD_MS)
+;; hco rename OLD NEW
+pub fn cmd_rename(s: ctr::store::Store, argv: [string]) -> int is
+    if array_len(argv) != 2 is return ui::fail("usage: hco rename CONTAINER NEW_NAME") end
+    let bad: string = validation::name(argv[1])
+    if bad != "" is return ui::fail(bad) end
+    let id: string = backend::resolve(s, argv[0])
+    if id == "" is return 1 end
+    if ctr::container_find(s, argv[1]) != "" is return ui::fail("the name " + argv[1] + " is already in use") end
+    utils::kv_set(s.st_root + "/containers/" + id + "/state", "name", argv[1])
+    ui::success(argv[0] + " " + colors::theme::muted("→") + " " + colors::bold(argv[1]))
+    return 0
+end
+
+;; hco inspect CONTAINER [--raw]
+pub fn cmd_inspect(s: ctr::store::Store, argv: [string]) -> int is
+    let p = args::parse(argv, [], false)
+    let id: string = backend::resolve(s, args::pos_at(p, 0))
+    if id == "" is return 1 end
+    if args::flag(p, ["--raw"]) is
+        let raw: string = ctr::container_inspect(s, id)
+        if utils::tool_exists("jq") is
+            write(utils::capture("printf '%s' " + utils::sq(raw) + " | jq ."))
+        else is
+            write(raw)
+        end
+        return 0
     end
-
-    image::destroy_bundle(c_id)
-    if c_ip != "" is db::ipam_release(c_id) end
-    logging::clear(logging::open_logger(LOG_ROOT, c_name))
-    db::delete_container(c_id)
-    log::info("Container '" + c_name + "' removed")
-    return nil
+    let st: string = ctr::container_status(s, id)
+    ui::title("container " + backend::name_of(s, id))
+    ui::kv("Id", colors::theme::code(id))
+    ui::kv("Status", ui::status_badge(st))
+    ui::kv("Image", db::meta_get(s, id, "image"))
+    ui::kv("Pid", if ctr::container_pid(s, id) > 0 then to_string(ctr::container_pid(s, id)) else "—" end)
+    ui::kv("Exit code", if st == "running" then "—" else to_string(ctr::container_exit_code(s, id)) end)
+    ui::kv("Restart", utils::or_default(db::meta_get(s, id, "policy"), "no"))
+    ui::kv("Pod", utils::or_default(db::meta_get(s, id, "pod"), "—"))
+    ui::kv("Preset", utils::or_default(db::meta_get(s, id, "preset"), "—"))
+    ui::kv("Seccomp", utils::or_default(db::meta_get(s, id, "seccomp"), "—"))
+    ui::kv("Health", utils::or_default(db::meta_get(s, id, "health_cmd"), "—"))
+    ui::kv("Network", utils::or_default(utils::kv_get(s.st_root + "/containers/" + id + "/state", "network"), "—"))
+    ui::kv("IP", utils::or_default(utils::kv_get(s.st_root + "/containers/" + id + "/state", "ip"), "—"))
+    ui::kv("Ports", utils::or_default(utils::kv_get(s.st_root + "/containers/" + id + "/state", "publish"), "—"))
+    ui::kv("Command", utils::or_default(utils::kv_get(s.st_root + "/containers/" + id + "/state", "command"), "—"))
+    ui::kv("Bundle", ctr::container_bundle(s, id))
+    ui::blank()
+    ui::hint("full JSON: hco inspect " + utils::short_id(id) + " --raw")
+    return 0
 end
 
-;; [EXPANDED] see module doc comment.
-pub fn restart_container(id_or_name: string) -> OpError? is
-    let row: db::ContainerRow? = db::find_container(id_or_name)
-    if row == nil is return op_err("No such container: " + id_or_name) end
-    let c: db::ContainerRow = row
-    let c_id: string = db::row_id(c)
-    let c_name: string = db::row_name(c)
-    let c_image: string = db::row_image(c)
-    let c_pod_id: string = db::row_pod_id(c)
-    let c_auto_restart: bool = db::row_auto_restart(c)
-
-    if db::row_status(c) == "Running" is
-        let stop_result: OpError? = stop_container(id_or_name, GRACE_PERIOD_MS)
-        if stop_result != nil is return stop_result end
+;; hco prune — removes every stopped container.
+pub fn cmd_prune(s: ctr::store::Store, argv: [string]) -> int is
+    let p = args::parse(argv, [], false)
+    let list: [ctr::runtime::ContainerInfo] = ctr::container_list(s)
+    let mut victims: [string] = []
+    let mut i: int = 0
+    while i < array_len(list) is
+        if list[i].ci_status != "running" && list[i].ci_status != "created" is victims = array_push(victims, list[i].ci_id) end
+        i += 1
     end
-
-    let cfg: config::HkConfig? = config::config_from_json(db::row_config_json(c))
-    if cfg == nil is return op_err("Stored config for '" + c_name + "' is corrupt, cannot restart") end
-
-    let opts: CreateOptions = CreateOptions {
-        name: c_name, image_ref: c_image, mounts: config::cfg_mounts(cfg), ports: config::cfg_port_mappings(cfg),
-        env: config::cfg_env(cfg), memory_limit: config::cfg_memory_limit(cfg), cpu_percent: config::cfg_cpu_percent(cfg),
-        cni_network: config::cfg_cni_network(cfg), rootless: config::cfg_rootless(cfg),
-        readonly_root: config::cfg_readonly_root(cfg), auto_restart: c_auto_restart,
-        seccomp: config::cfg_seccomp_profile(cfg), pod_id: c_pod_id
-    }
-    db::delete_container(c_id)
-    let created: (string, OpError?) = create_container(opts)
-    return created.1
+    if array_len(victims) == 0 is
+        ui::info("nothing to prune")
+        return 0
+    end
+    if !args::flag(p, ["-f", "--force"]) && !ui::confirm("remove " + to_string(array_len(victims)) + " stopped container(s)?") is
+        ui::info("cancelled")
+        return 0
+    end
+    let mut n: int = 0
+    let mut k: int = 0
+    while k < array_len(victims) is
+        if ctr::container_remove(s, victims[k], true) is
+            db::meta_drop(s, victims[k])
+            n += 1
+        end
+        k += 1
+    end
+    ui::success("removed " + to_string(n) + " container(s)")
+    return 0
 end
 
-pub fn list_containers(page: int, per_page: int) -> ([db::ContainerRow], int) is
-    return db::list_containers_paged(page, per_page)
+;; ── health + supervision ─────────────────────────────────────────────────────
+
+;; Runs the container's health command. Returns "healthy", "unhealthy" or "none".
+pub fn health_of(s: ctr::store::Store, id: string) -> string is
+    let hc: string = db::meta_get(s, id, "health_cmd")
+    if hc == "" is return "none" end
+    if !backend::is_running(s, id) is return "unhealthy" end
+    let rc: int = ctr::container_exec(s, id, ["sh", "-c", hc], [], "", "")
+    if rc == 0 is return "healthy" end
+    return "unhealthy"
 end
 
-pub fn inspect_container(id_or_name: string) -> db::ContainerRow? is
-    return db::find_container(id_or_name)
+;; hco health CONTAINER
+pub fn cmd_health(s: ctr::store::Store, argv: [string]) -> int is
+    if array_len(argv) != 1 is return ui::fail("usage: hco health CONTAINER") end
+    let id: string = backend::resolve(s, argv[0])
+    if id == "" is return 1 end
+    let h: string = health_of(s, id)
+    if h == "none" is
+        ui::info("no health check configured")
+        ui::hint("set one with: hco run --health-cmd 'curl -f localhost' ...")
+        return 0
+    end
+    write(ui::status_badge(h))
+    if h == "healthy" is return 0 end
+    return 1
 end
 
-pub fn container_stats(id_or_name: string) -> metrics::ContainerStats? is
-    let row: db::ContainerRow? = db::find_container(id_or_name)
-    if row == nil is return nil end
-    return metrics::collect_stats(db::row_id(row), db::row_pid(row))
+;; One supervision pass: restart containers whose policy says so.
+;; Returns the number of restarts performed.
+pub fn supervise_once(s: ctr::store::Store) -> int is
+    let list: [ctr::runtime::ContainerInfo] = ctr::container_list(s)
+    let mut n: int = 0
+    let mut i: int = 0
+    while i < array_len(list) is
+        let c: ctr::runtime::ContainerInfo = list[i]
+        let pol: string = db::meta_get(s, c.ci_id, "policy")
+        let stopped_by_user: bool = db::meta_get(s, c.ci_id, "user_stopped") == "1"
+        if c.ci_status == "exited" && !stopped_by_user is
+            let restart: bool = pol == "always" || pol == "unless-stopped" || (pol == "on-failure" && c.ci_exit != 0)
+            if restart is
+                let count: int = utils::atoi(db::meta_get(s, c.ci_id, "restarts")) + 1
+                db::meta_set(s, c.ci_id, "restarts", to_string(count))
+                if ctr::container_start(s, c.ci_id, false) == 0 is
+                    db::event(s, "container", utils::short_id(c.ci_id), "auto-restart #" + to_string(count) + " (policy " + pol + ")")
+                    ui::info("restarted " + colors::bold(c.ci_name) + " " + colors::theme::muted("(policy " + pol + ", #" + to_string(count) + ")"))
+                    n += 1
+                end
+            end
+        end
+        i += 1
+    end
+    return n
 end
 
-pub fn container_logs(id_or_name: string, lines: int) -> [string]? is
-    let row: db::ContainerRow? = db::find_container(id_or_name)
-    if row == nil is return nil end
-    return logging::tail(logging::open_logger(LOG_ROOT, db::row_name(row)), lines)
+;; hco supervise [--interval SECONDS] [--once]
+pub fn cmd_supervise(s: ctr::store::Store, argv: [string]) -> int is
+    let p = args::parse(argv, ["--interval"], false)
+    let every: int = utils::atoi(utils::or_default(args::get(p, ["--interval"]), "5"))
+    if args::flag(p, ["--once"]) is
+        write(to_string(supervise_once(s)))
+        return 0
+    end
+    ui::info("supervising restart policies every " + to_string(every) + "s — Ctrl-C to stop")
+    while true is
+        supervise_once(s)
+        sleep_ms(every * 1000)
+    end
+    return 0
 end
