@@ -1,271 +1,320 @@
-use "std -> net_http" from "http"
-use "std -> json" from "json"
-use "std -> log" from "log"
-use "std -> env" from "env"
-use "std -> strings" from "str"
+use "bit -> container" from "ctr"
+use "bit -> colors"
 
-mod container
-mod pod
+mod utils
+mod ui
+mod args
+mod backend
 mod db
 mod metrics
+mod system
 mod tls
 
-fn json_response(res: http::Response, status: int, body: any) is
-    http::set_status(res, status)
-    http::set_header(res, "Content-Type", "application/json")
-    http::write_body(res, json::stringify(body))
+fn lb() -> string is
+    return "{"
 end
 
-fn error_response(res: http::Response, status: int, message: string) is
-    let mut body: any = json::object()
-    json::set(body, "error", message)
-    json_response(res, status, body)
+fn rb() -> string is
+    return "}"
 end
 
-fn container_to_json(c: db::ContainerRow) -> any is
-    let mut body: any = json::object()
-    json::set(body, "id", db::row_id(c))
-    json::set(body, "name", db::row_name(c))
-    json::set(body, "image", db::row_image(c))
-    json::set(body, "pid", db::row_pid(c))
-    json::set(body, "status", db::row_status(c))
-    json::set(body, "ip_address", db::row_ip_address(c))
-    json::set(body, "ports", db::row_ports(c))
-    json::set(body, "pod_id", db::row_pod_id(c))
-    json::set(body, "created_at", db::row_created_at(c))
-    return body
+;; ── JSON helpers ─────────────────────────────────────────────────────────────
+
+pub fn esc(v: string) -> string is
+    let mut o: string = string_replace(v, "\\", "\\\\")
+    o = string_replace(o, "\"", "\\\"")
+    o = string_replace(o, "\n", "\\n")
+    o = string_replace(o, "\r", "\\r")
+    o = string_replace(o, "\t", "\\t")
+    return o
 end
 
-fn pod_to_json(p: db::PodRow) -> any is
-    let mut body: any = json::object()
-    json::set(body, "name", db::pod_row_name(p))
-    json::set(body, "container_ids", db::pod_container_ids(p))
-    json::set(body, "status", db::pod_row_status(p))
-    json::set(body, "shared_network", db::pod_row_shared_network(p))
-    json::set(body, "created_at", db::pod_row_created_at(p))
-    return body
+fn js(v: string) -> string is
+    return "\"" + esc(v) + "\""
 end
 
-;; ── handlers ──────────────────────────────────────────────────────────────────
+fn field(name: string, raw_json: string) -> string is
+    return "\"" + name + "\":" + raw_json
+end
 
-fn handle_list_containers(req: http::Request, res: http::Response) is
-    let page: int = http::query_int(req, "page", 1)
-    let per_page: int = http::query_int(req, "per_page", 50)
-    let result: ([db::ContainerRow], int) = container::list_containers(page, per_page)
-    let mut items: [any] = []
-    for c in result.0 is
-        items = array_push(items, container_to_json(c))
+fn obj(fields: [string]) -> string is
+    return lb() + utils::join(fields, ",") + rb()
+end
+
+fn arr(items: [string]) -> string is
+    return "[" + utils::join(items, ",") + "]"
+end
+
+fn container_json(s: ctr::store::Store, c: ctr::runtime::ContainerInfo) -> string is
+    return obj([field("id", js(c.ci_id)), field("name", js(c.ci_name)), field("image", js(c.ci_image)), field("status", js(c.ci_status)), field("pid", to_string(c.ci_pid)), field("exit_code", to_string(c.ci_exit)), field("ip", js(c.ci_ip)), field("created", js(c.ci_created)), field("command", js(c.ci_command)), field("pod", js(db::meta_get(s, c.ci_id, "pod"))), field("restart_policy", js(utils::or_default(db::meta_get(s, c.ci_id, "policy"), "no")))])
+end
+
+;; ── Auth ─────────────────────────────────────────────────────────────────────
+
+pub fn token_path(s: ctr::store::Store) -> string is
+    return db::dir(s) + "/api.token"
+end
+
+pub fn token(s: ctr::store::Store) -> string is
+    let t: string = env_get("HCO_API_TOKEN")
+    if t != "" is return t end
+    return utils::read_trim(token_path(s))
+end
+
+;; ── Responses ────────────────────────────────────────────────────────────────
+
+fn respond(code: int, reason: string, ctype: string, body: string) is
+    write("HTTP/1.1 " + to_string(code) + " " + reason + "\r")
+    write("Content-Type: " + ctype + "\r")
+    write("Server: hco/" + system::version() + "\r")
+    write("Connection: close\r")
+    write("\r")
+    utils::run("printf '%s' " + utils::sq(body))
+end
+
+fn json(code: int, reason: string, body: string) is
+    respond(code, reason, "application/json", body + "\n")
+end
+
+fn error(code: int, reason: string, msg: string) is
+    json(code, reason, obj([field("error", js(msg))]))
+end
+
+fn query_value(query: string, key: string) -> string is
+    let parts: [string] = string_split(query, "&")
+    let mut i: int = 0
+    while i < array_len(parts) is
+        if utils::head_before(parts[i], "=") == key is return utils::tail_after(parts[i], "=") end
+        i += 1
     end
-    let mut body: any = json::object()
-    json::set(body, "items", items)
-    json::set(body, "total", result.1)
-    json::set(body, "page", page)
-    json_response(res, 200, body)
+    return ""
 end
 
-fn handle_create_container(req: http::Request, res: http::Response) is
-    let parsed: any? = json::parse(http::body_text(req))
-    if parsed == nil is
-        error_response(res, 400, "Invalid JSON body")
+;; ── Routing ──────────────────────────────────────────────────────────────────
+
+fn do_container(s: ctr::store::Store, method: string, id_ref: string, action: string, query: string) is
+    let id: string = ctr::container_find(s, id_ref)
+    if id == "" is
+        error(404, "Not Found", "no such container: " + id_ref)
         return
     end
-    let b: any = parsed
-    let opts: container::CreateOptions = container::CreateOptions {
-        name: json::get_string(b, "name", ""),
-        image_ref: json::get_string(b, "image", ""),
-        mounts: json::get_string_array(b, "mounts"),
-        ports: json::get_string_array(b, "ports"),
-        env: json::get_string_array(b, "env"),
-        memory_limit: json::get_string(b, "memory_limit", ""),
-        cpu_percent: json::get_int(b, "cpu_percent", 0),
-        cni_network: json::get_string(b, "cni_network", ""),
-        rootless: json::get_bool(b, "rootless", false),
-        readonly_root: json::get_bool(b, "readonly_root", false),
-        auto_restart: json::get_bool(b, "auto_restart", false),
-        seccomp: json::get_string(b, "seccomp_profile", ""),
-        pod_id: json::get_string(b, "pod_id", "")
-    }
-    let result: (string, container::OpError?) = container::create_container(opts)
-    if result.1 != nil is
-        error_response(res, 400, container::op_error_message(result.1))
-        return
-    end
-    let mut body: any = json::object()
-    json::set(body, "id", result.0)
-    json_response(res, 201, body)
-end
-
-fn handle_get_container(req: http::Request, res: http::Response) is
-    let id: string = http::path_param(req, "id")
-    let row: db::ContainerRow? = container::inspect_container(id)
-    if row == nil is
-        error_response(res, 404, "No such container: " + id)
-        return
-    end
-    json_response(res, 200, container_to_json(row))
-end
-
-fn handle_stop_container(req: http::Request, res: http::Response) is
-    let id: string = http::path_param(req, "id")
-    let result: container::OpError? = container::stop_container(id, 5000)
-    if result != nil is
-        error_response(res, 400, container::op_error_message(result))
-        return
-    end
-    http::set_status(res, 204)
-end
-
-fn handle_restart_container(req: http::Request, res: http::Response) is
-    let id: string = http::path_param(req, "id")
-    let result: container::OpError? = container::restart_container(id)
-    if result != nil is
-        error_response(res, 400, container::op_error_message(result))
-        return
-    end
-    http::set_status(res, 204)
-end
-
-fn handle_delete_container(req: http::Request, res: http::Response) is
-    let id: string = http::path_param(req, "id")
-    let force: bool = http::query_bool(req, "force", false)
-    let result: container::OpError? = container::remove_container(id, force)
-    if result != nil is
-        error_response(res, 400, container::op_error_message(result))
-        return
-    end
-    http::set_status(res, 204)
-end
-
-fn handle_container_stats(req: http::Request, res: http::Response) is
-    let id: string = http::path_param(req, "id")
-    let stats: metrics::ContainerStats? = container::container_stats(id)
-    if stats == nil is
-        error_response(res, 404, "No such container: " + id)
-        return
-    end
-    let s: metrics::ContainerStats = stats
-    let mut body: any = json::object()
-    json::set(body, "memory_bytes", metrics::stats_memory_bytes(s))
-    json::set(body, "memory_limit", metrics::stats_memory_limit(s))
-    json::set(body, "cpu_percent", metrics::stats_cpu_percent(s))
-    json::set(body, "pids", metrics::stats_pids(s))
-    json::set(body, "net_rx_bytes", metrics::stats_net_rx_bytes(s))
-    json::set(body, "net_tx_bytes", metrics::stats_net_tx_bytes(s))
-    json_response(res, 200, body)
-end
-
-fn handle_container_logs(req: http::Request, res: http::Response) is
-    let id: string = http::path_param(req, "id")
-    let lines: int = http::query_int(req, "lines", 100)
-    let logs: [string]? = container::container_logs(id, lines)
-    if logs == nil is
-        error_response(res, 404, "No such container: " + id)
-        return
-    end
-    http::set_status(res, 200)
-    http::set_header(res, "Content-Type", "text/plain")
-    http::write_body(res, str::join(logs, "\n"))
-end
-
-fn handle_list_pods(req: http::Request, res: http::Response) is
-    let page: int = http::query_int(req, "page", 1)
-    let per_page: int = http::query_int(req, "per_page", 50)
-    let result: ([db::PodRow], int) = pod::list_pods(page, per_page)
-    let mut items: [any] = []
-    for p in result.0 is
-        items = array_push(items, pod_to_json(p))
-    end
-    let mut body: any = json::object()
-    json::set(body, "items", items)
-    json::set(body, "total", result.1)
-    json_response(res, 200, body)
-end
-
-fn handle_create_pod(req: http::Request, res: http::Response) is
-    let parsed: any? = json::parse(http::body_text(req))
-    if parsed == nil is
-        error_response(res, 400, "Invalid JSON body")
-        return
-    end
-    let b: any = parsed
-    let opts: pod::PodCreateOptions = pod::PodCreateOptions {
-        name: json::get_string(b, "name", ""),
-        shared_network: json::get_bool(b, "shared_network", true),
-        shared_pid: json::get_bool(b, "shared_pid", true),
-        shared_ipc: json::get_bool(b, "shared_ipc", true),
-        cni_network: json::get_string(b, "cni_network", "")
-    }
-    let result: (string, pod::OpError?) = pod::create_pod(opts)
-    if result.1 != nil is
-        error_response(res, 400, pod::op_error_message(result.1))
-        return
-    end
-    let mut body: any = json::object()
-    json::set(body, "name", result.0)
-    json_response(res, 201, body)
-end
-
-fn handle_delete_pod(req: http::Request, res: http::Response) is
-    let name: string = http::path_param(req, "name")
-    let force: bool = http::query_bool(req, "force", false)
-    let result: pod::OpError? = pod::remove_pod(name, force)
-    if result != nil is
-        error_response(res, 400, pod::op_error_message(result))
-        return
-    end
-    http::set_status(res, 204)
-end
-
-;; [EXPANDED] see module doc comment.
-fn handle_healthz(req: http::Request, res: http::Response) is
-    http::set_status(res, 200)
-    http::write_body(res, "ok")
-end
-
-fn handle_metrics(req: http::Request, res: http::Response) is
-    let result: ([db::ContainerRow], int) = container::list_containers(1, 10000)
-    let mut samples: [(string, string, metrics::ContainerStats)] = []
-    for c in result.0 is
-        if db::row_status(c) == "Running" is
-            samples = array_push(samples, (db::row_id(c), db::row_name(c), metrics::collect_stats(db::row_id(c), db::row_pid(c))))
+    if action == "" && method == "GET" is
+        let all: [ctr::runtime::ContainerInfo] = ctr::container_list(s)
+        let mut i: int = 0
+        while i < array_len(all) is
+            if all[i].ci_id == id is json(200, "OK", container_json(s, all[i])) end
+            i += 1
         end
+        return
     end
-    http::set_status(res, 200)
-    http::set_header(res, "Content-Type", "text/plain; version=0.0.4")
-    http::write_body(res, metrics::render_prometheus(samples))
+    if action == "" && method == "DELETE" is
+        if ctr::container_remove(s, id, true) is
+            db::meta_drop(s, id)
+            db::event(s, "api", utils::short_id(id), "remove")
+            json(200, "OK", obj([field("removed", js(id))]))
+        else is
+            error(500, "Internal Server Error", "cannot remove container")
+        end
+        return
+    end
+    if action == "logs" && method == "GET" is
+        let n: int = utils::atoi(query_value(query, "tail"))
+        let text: string = if n > 0 then ctr::container_logs_tail(s, id, n) else ctr::container_logs(s, id) end
+        respond(200, "OK", "text/plain; charset=utf-8", text + "\n")
+        return
+    end
+    if method != "POST" is
+        error(405, "Method Not Allowed", action + " requires POST")
+        return
+    end
+    let mut good: bool = false
+    if action == "start" is
+        good = ctr::container_start(s, id, false) == 0
+    else if action == "stop" is
+        good = ctr::container_stop(s, id, 10)
+    else if action == "restart" is
+        ctr::container_stop(s, id, 10)
+        good = ctr::container_start(s, id, false) == 0
+    else if action == "kill" is
+        good = ctr::container_kill(s, id, utils::or_default(query_value(query, "signal"), "KILL"))
+    else is
+        error(404, "Not Found", "unknown action: " + action)
+        return
+    end
+    db::event(s, "api", utils::short_id(id), action)
+    if good is
+        json(200, "OK", obj([field("id", js(id)), field("action", js(action)), field("ok", "true")]))
+    else is
+        error(500, "Internal Server Error", action + " failed")
+    end
 end
 
-;; ── routing / bootstrap ───────────────────────────────────────────────────────
-
-pub fn run_server(bind_addr: string, cert_path: string, key_path: string, socket_activated: bool) is
-    let mut router: http::Router = http::new_router()
-
-    http::get(router, "/healthz", handle_healthz)
-    http::get(router, "/metrics", handle_metrics)
-
-    http::get(router, "/containers", handle_list_containers)
-    http::post(router, "/containers", handle_create_container)
-    http::get(router, "/containers/:id", handle_get_container)
-    http::post(router, "/containers/:id/stop", handle_stop_container)
-    http::post(router, "/containers/:id/restart", handle_restart_container)
-    http::delete(router, "/containers/:id", handle_delete_container)
-    http::get(router, "/containers/:id/stats", handle_container_stats)
-    http::get(router, "/containers/:id/logs", handle_container_logs)
-
-    http::get(router, "/pods", handle_list_pods)
-    http::post(router, "/pods", handle_create_pod)
-    http::delete(router, "/pods/:name", handle_delete_pod)
-
-    if tls::tls_files_present(cert_path, key_path) is
-        let tls_cfg: any? = tls::build_server_config(cert_path, key_path)
-        if tls_cfg != nil is
-            log::info("hco API listening on https://" + bind_addr)
-            http::serve_tls(router, bind_addr, tls_cfg, socket_activated)
-            return
-        end
-        log::warn("TLS requested but cert/key could not be loaded; falling back to HTTP")
+fn route(s: ctr::store::Store, method: string, path: string, query: string) is
+    if path == "/version" && method == "GET" is
+        json(200, "OK", obj([field("hco", js(system::version())), field("container", js(ctr::version()))]))
+        return
     end
+    if path == "/metrics" && method == "GET" is
+        respond(200, "OK", "text/plain; version=0.0.4", metrics::prometheus(s))
+        return
+    end
+    if path == "/images" && method == "GET" is
+        let all: [ctr::image::ImageInfo] = ctr::image_list(s)
+        let mut out: [string] = []
+        let mut i: int = 0
+        while i < array_len(all) is
+            out = array_push(out, obj([field("id", js(all[i].ii_id)), field("names", arr(quoted(all[i].ii_names))), field("size", to_string(all[i].ii_size)), field("created", js(all[i].ii_created))]))
+            i += 1
+        end
+        json(200, "OK", arr(out))
+        return
+    end
+    if path == "/pods" && method == "GET" is
+        let pods: [string] = db::pod_names(s)
+        let mut out2: [string] = []
+        let mut k: int = 0
+        while k < array_len(pods) is
+            out2 = array_push(out2, obj([field("name", js(pods[k])), field("containers", to_string(array_len(db::pod_members(s, pods[k]))))]))
+            k += 1
+        end
+        json(200, "OK", arr(out2))
+        return
+    end
+    if path == "/containers" && method == "GET" is
+        let all2: [ctr::runtime::ContainerInfo] = ctr::container_list(s)
+        let want_all: bool = query_value(query, "all") == "1" || query_value(query, "all") == "true"
+        let mut out3: [string] = []
+        let mut j: int = 0
+        while j < array_len(all2) is
+            if want_all || all2[j].ci_status == "running" is out3 = array_push(out3, container_json(s, all2[j])) end
+            j += 1
+        end
+        json(200, "OK", arr(out3))
+        return
+    end
+    if string_starts_with(path, "/containers/") is
+        let rest: string = string_slice(path, 12, string_len(path))
+        let id_ref: string = utils::head_before(rest, "/")
+        let action: string = utils::tail_after(rest, "/")
+        do_container(s, method, id_ref, action, query)
+        return
+    end
+    error(404, "Not Found", "no route for " + method + " " + path)
+end
 
-    log::info("hco API listening on http://" + bind_addr)
-    http::serve(router, bind_addr, socket_activated)
+fn quoted(items: [string]) -> [string] is
+    let mut out: [string] = []
+    let mut i: int = 0
+    while i < array_len(items) is
+        out = array_push(out, js(items[i]))
+        i += 1
+    end
+    return out
+end
+
+;; Handles exactly one HTTP request read from stdin. Used as `hco api-conn`.
+pub fn serve_conn(s: ctr::store::Store) -> int is
+    let first: string = string_trim(env_read_line())
+    if first == "" is return 0 end
+    let parts: [string] = string_split(first, " ")
+    if array_len(parts) < 2 is
+        error(400, "Bad Request", "malformed request line")
+        return 0
+    end
+    let method: string = string_upper(parts[0])
+    let target: string = parts[1]
+    let path: string = utils::head_before(target, "?")
+    let query: string = utils::tail_after(target, "?")
+    let mut auth: string = ""
+    let mut guard: int = 0
+    while guard < 100 is
+        let h: string = string_trim(env_read_line())
+        if h == "" is break end
+        if string_starts_with(string_lower(h), "authorization:") is auth = string_trim(utils::tail_after(h, ":")) end
+        guard += 1
+    end
+    if path == "/health" is
+        json(200, "OK", obj([field("status", js("ok"))]))
+        return 0
+    end
+    let tok: string = token(s)
+    if tok == "" && env_get("HCO_API_INSECURE") != "1" is
+        error(503, "Service Unavailable", "no API token configured (run: hco api token)")
+        return 0
+    end
+    if tok != "" && auth != "Bearer " + tok is
+        write("HTTP/1.1 401 Unauthorized\r")
+        write("WWW-Authenticate: Bearer\r")
+        write("Content-Type: application/json\r")
+        write("Connection: close\r")
+        write("\r")
+        write(obj([field("error", js("missing or wrong bearer token"))]))
+        return 0
+    end
+    route(s, method, path, query)
+    return 0
+end
+
+;; ── Launcher ─────────────────────────────────────────────────────────────────
+
+fn self_path() -> string is
+    let w: string = utils::capture("command -v hco 2>/dev/null")
+    if w != "" is return w end
+    return "hco"
+end
+
+;; hco api token [--rotate]
+fn cmd_token(s: ctr::store::Store, argv: [string]) -> int is
+    let p = args::parse(argv, [], false)
+    if file_exists(token_path(s)) && !args::flag(p, ["--rotate"]) is
+        ui::title("API token")
+        write(utils::read_trim(token_path(s)))
+        ui::hint("rotate with: hco api token --rotate")
+        return 0
+    end
+    let t: string = utils::capture("head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \\n'")
+    if t == "" is return ui::fail("cannot read /dev/urandom") end
+    utils::write_file(token_path(s), t + "\n")
+    utils::quiet("chmod 600 " + utils::sq(token_path(s)))
+    ui::success("new API token written to " + colors::bold(token_path(s)))
+    write(t)
+    return 0
+end
+
+;; hco serve [--bind HOST:PORT | --unix PATH] [--tls]
+pub fn cmd_serve(s: ctr::store::Store, argv: [string]) -> int is
+    let p = args::parse(argv, ["--bind", "--unix", "--tls-cert", "--tls-key"], false)
+    if !utils::tool_exists("socat") is return ui::fail_hint("socat is required to serve the API", "install it, or use the systemd socket unit (services/hco-api.socket)") end
+    if token(s) == "" is
+        ui::warn("no API token yet — creating one")
+        cmd_token(s, [])
+    end
+    let handler: string = "EXEC:" + utils::sq(self_path() + " api-conn")
+    let unix: string = args::get(p, ["--unix"])
+    let use_tls: bool = args::flag(p, ["--tls"]) || args::get(p, ["--tls-cert"]) != ""
+    if unix != "" is
+        ui::info("serving on unix:" + colors::bold(unix))
+        return utils::run("socat UNIX-LISTEN:" + utils::sq(unix) + ",fork,mode=660,unlink-early " + handler)
+    end
+    let bind: string = utils::or_default(args::get(p, ["--bind"]), "127.0.0.1:7443")
+    let host: string = utils::head_before(bind, ":")
+    let port: string = utils::tail_after(bind, ":")
+    if use_tls is
+        let cert: string = utils::or_default(args::get(p, ["--tls-cert"]), tls::cert_path(s))
+        let key: string = utils::or_default(args::get(p, ["--tls-key"]), tls::key_path(s))
+        if !file_exists(cert) || !file_exists(key) is return ui::fail_hint("TLS certificate not found", "create one with: hco tls init") end
+        ui::info("serving " + colors::bold("https://" + bind) + ui::muted("  (Ctrl-C to stop)"))
+        return utils::run("socat OPENSSL-LISTEN:" + port + ",bind=" + host + ",reuseaddr,fork,cert=" + utils::sq(cert) + ",key=" + utils::sq(key) + ",verify=0 " + handler)
+    end
+    ui::info("serving " + colors::bold("http://" + bind) + ui::muted("  (Ctrl-C to stop)"))
+    return utils::run("socat TCP-LISTEN:" + port + ",bind=" + host + ",reuseaddr,fork " + handler)
+end
+
+pub fn cmd_api(s: ctr::store::Store, argv: [string]) -> int is
+    if array_len(argv) > 0 && argv[0] == "token" is return cmd_token(s, args::argv_tail(argv, 1)) end
+    ui::title("hco api")
+    ui::help_cmd("token", "[--rotate]", "show or rotate the bearer token")
+    ui::help_cmd("serve", "", "same as: hco serve")
+    ui::hint("endpoints: /health /version /metrics /containers /images /pods")
+    return 0
 end
