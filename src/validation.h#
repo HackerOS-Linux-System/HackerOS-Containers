@@ -1,148 +1,108 @@
-use "std -> strings" from "str"
-use "std -> regex" from "re"
+mod utils
 
-pub struct ValidationError is
-    pub message: string
-end
-
-pub fn validation_error_message(e: ValidationError) -> string is return e.message end
-
-fn err(msg: string) -> ValidationError is
-    return ValidationError { message: msg }
-end
-
-pub fn validate_name(name: string) -> ValidationError? is
-    if name == "" is return err("Name cannot be empty") end
-    if str::len(name) > 128 is return err("Name too long (max 128 chars)") end
-    if !re::is_match(name, "^[a-zA-Z0-9_\\-]+$") is
-        return err("Invalid name '" + name + "': only alphanumeric, dash, underscore allowed")
+fn all_in(s: string, allowed: string) -> bool is
+    let mut i: int = 0
+    while i < string_len(s) is
+        if !string_contains(allowed, string_at(s, i)) is return false end
+        i += 1
     end
-    return nil
+    return true
 end
 
-pub fn validate_image_ref(image: string) -> ValidationError? is
-    if image == "" is return err("Image reference cannot be empty") end
-    if str::len(image) > 512 is return err("Image reference too long") end
-    let forbidden: [string] = ["`", "$", ";", "&", "|", ">", "<", "(", ")", "{", "}", "\\"]
-    for ch in forbidden is
-        if str::contains(image, ch) is
-            return err("Invalid character '" + ch + "' in image reference")
+const NAME_CHARS: string = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-"
+const ALNUM: string = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+
+;; Container / pod / volume names: [a-zA-Z0-9][a-zA-Z0-9_.-]{0,62}
+pub fn name(n: string) -> string is
+    if n == "" is return "name must not be empty" end
+    if string_len(n) > 63 is return "name is longer than 63 characters" end
+    if !string_contains(ALNUM, string_at(n, 0)) is return "name must start with a letter or digit" end
+    if !all_in(n, NAME_CHARS) is return "name may only contain letters, digits, '_', '.' and '-'" end
+    return ""
+end
+
+;; "80", "8080:80", "127.0.0.1:8080:80", with optional "/tcp" or "/udp".
+pub fn publish(spec: string) -> string is
+    let mut body: string = spec
+    let slash: int = string_rfind(spec, "/")
+    if slash >= 0 is
+        let proto: string = string_slice(spec, slash + 1, string_len(spec))
+        if proto != "tcp" && proto != "udp" is return "protocol must be tcp or udp in '" + spec + "'" end
+        body = string_slice(spec, 0, slash)
+    end
+    let parts: [string] = string_split(body, ":")
+    let n: int = array_len(parts)
+    if n < 1 || n > 3 is return "'" + spec + "' is not [ip:]host:container" end
+    let mut i: int = 0
+    while i < n is
+        let p: string = parts[i]
+        if n == 3 && i == 0 is
+            if !all_in(p, "0123456789.") || p == "" is return "'" + p + "' is not an IPv4 address" end
+        else is
+            if !utils::is_number(p) is return "'" + p + "' is not a port number" end
+            let v: int = utils::atoi(p)
+            if v < 1 || v > 65535 is return "port " + p + " is out of range 1-65535" end
         end
+        i += 1
     end
-    return nil
+    return ""
 end
 
-;; Result-ish triple: (host_path, container_path, options, error)
-pub struct MountSpec is
-    pub host_path:      string
-    pub container_path: string
-    pub options:        string ;; "" == None
-    pub error:          string ;; "" == ok
+;; Memory limit such as 256m, 2g.
+pub fn memory(v: string) -> string is
+    let b: int = utils::parse_size(v)
+    if b < 0 is return "'" + v + "' is not a size (try 256m or 2g)" end
+    if b < 4194304 is return "memory limit must be at least 4m" end
+    return ""
 end
 
-fn blocked_host_path(host_path: string) -> bool is
-    let normalized: string = if str::ends_with(host_path, "/") && str::len(host_path) > 1
-        then str::slice(host_path, 0, str::len(host_path) - 1)
-        else host_path
-    let blocked: [string] = ["/proc", "/sys", "/dev", "/run/hackeros", "/etc/shadow", "/etc/passwd", "/root", "/etc"]
-    for b in blocked is
-        ;; [FIXED] exact-match OR "starts with b + /" — the old Rust
-        ;; `starts_with(b)` alone would also match "/etcfoo" as blocked
-        ;; by "/etc", which is a false positive; this is the corrected,
-        ;; boundary-aware version of the same check.
-        if normalized == b || str::starts_with(normalized, b + "/") is return true end
-    end
-    return false
+;; CPU limit such as 0.5, 2.
+pub fn cpus(v: string) -> string is
+    if v == "" is return "cpus must not be empty" end
+    if !all_in(v, "0123456789.") is return "'" + v + "' is not a number of CPUs" end
+    if string_len(v) == 1 && v == "0" is return "cpus must be greater than 0" end
+    return ""
 end
 
-fn canonicalize_host_path(raw: string) -> string is
-    if raw == "" is return "" end
-    if !str::starts_with(raw, "/") is return "" end
-    for part in str::split(raw, "/") is
-        if part == ".." is return "" end
-    end
-    return raw
+;; "host-path:/in/container[:ro]" or "name:/in/container".
+pub fn volume(spec: string) -> string is
+    let parts: [string] = string_split(spec, ":")
+    if array_len(parts) < 2 || array_len(parts) > 3 is return "'" + spec + "' is not source:target[:ro]" end
+    if parts[0] == "" is return "volume source must not be empty" end
+    if !string_starts_with(parts[1], "/") is return "volume target '" + parts[1] + "' must be an absolute path" end
+    if array_len(parts) == 3 && parts[2] != "ro" && parts[2] != "rw" is return "volume mode must be ro or rw" end
+    return ""
 end
 
-fn sanitize_container_path(raw: string) -> string is
-    if raw == "" is return "" end
-    for part in str::split(raw, "/") is
-        if part == ".." is return "" end
-    end
-    if str::starts_with(raw, "/") is return raw end
-    return "/" + raw
+pub fn env_pair(spec: string) -> string is
+    if string_find(spec, "=") < 1 is return "'" + spec + "' is not NAME=value" end
+    let key: string = utils::head_before(spec, "=")
+    if string_contains("0123456789", string_at(key, 0)) is return "environment name '" + key + "' must not start with a digit" end
+    if !all_in(key, NAME_CHARS) is return "environment name '" + key + "' has invalid characters" end
+    return ""
 end
 
-pub fn validate_mount(mount_spec: string) -> MountSpec is
-    let parts: [string] = str::splitn(mount_spec, ":", 3)
-    if array_len(parts) < 2 is
-        return MountSpec { host_path: "", container_path: "", options: "",
-                            error: "Invalid mount spec '" + mount_spec + "': expected host:container" }
-    end
-
-    let host: string = canonicalize_host_path(parts[0])
-    if host == "" is
-        return MountSpec { host_path: "", container_path: "", options: "",
-                            error: "Mount host path must be absolute and traversal-free: '" + parts[0] + "'" }
-    end
-
-    let container: string = sanitize_container_path(parts[1])
-    if container == "" is
-        return MountSpec { host_path: "", container_path: "", options: "",
-                            error: "Path traversal in container path: '" + parts[1] + "'" }
-    end
-
-    if blocked_host_path(host) is
-        return MountSpec { host_path: "", container_path: "", options: "",
-                            error: "Mount of sensitive path '" + host + "' is not allowed" }
-    end
-
-    let opts: string = if array_len(parts) > 2 then parts[2] else ""
-    return MountSpec { host_path: host, container_path: container, options: opts, error: "" }
+pub fn restart_policy(p: string) -> string is
+    if p == "no" || p == "always" || p == "on-failure" || p == "unless-stopped" is return "" end
+    return "restart policy must be no, on-failure, always or unless-stopped"
 end
 
-pub fn validate_port_mapping(port_spec: string) -> ValidationError? is
-    if !re::is_match(port_spec, "^(\\d{1,5}):(\\d{1,5})(/(tcp|udp))?$") is
-        return err("Invalid port mapping '" + port_spec + "': use host:container[/tcp|udp]")
-    end
-    let parts: [string] = str::split(port_spec, ":")
-    let host_port: int = conv::str_to_int(parts[0])
-    let cp_part: [string] = str::split(parts[1], "/")
-    let container_port: int = conv::str_to_int(cp_part[0])
-    if host_port == 0 || container_port == 0 is return err("Port numbers must be > 0") end
-    if host_port > 65535 || container_port > 65535 is return err("Port numbers must be <= 65535") end
-    return nil
+pub fn network_mode(m: string) -> string is
+    if m == "bridge" || m == "host" || m == "none" is return "" end
+    return "network must be bridge, host or none"
 end
 
-pub fn validate_env_var(env_spec: string) -> ValidationError? is
-    let eq: int = str::find(env_spec, "=")
-    if eq < 0 is return err("Invalid env var '" + env_spec + "': must be KEY=VALUE") end
-    let key: string = str::slice(env_spec, 0, eq)
-    if key == "" is return err("Env var key cannot be empty") end
-    if !re::is_match(key, "^[A-Za-z_][A-Za-z0-9_]*$") is
-        return err("Invalid env var key '" + key + "'")
-    end
-    return nil
+;; Image references: no whitespace, not empty.
+pub fn image_ref(r: string) -> string is
+    if r == "" is return "image reference must not be empty" end
+    if string_contains(r, " ") is return "image reference must not contain spaces" end
+    return ""
 end
 
-pub fn validate_cni_network_name(name: string) -> ValidationError? is
-    if name == "" is return err("CNI network name cannot be empty") end
-    if !re::is_match(name, "^[a-zA-Z0-9_\\-]+$") is
-        return err("Invalid CNI network name '" + name + "'")
-    end
-    return nil
-end
-
-pub fn validate_memory_limit(limit: string) -> ValidationError? is
-    if !re::is_match(str::to_upper(limit), "^\\d+(B|KB|MB|GB)$") is
-        return err("Invalid memory limit '" + limit + "': use e.g. 512MB or 2GB")
-    end
-    return nil
-end
-
-pub fn validate_cpu_percent(pct: int) -> ValidationError? is
-    if pct == 0 || pct > 100 is
-        return err("cpu_percent must be 1-100, got " + to_string(pct))
-    end
-    return nil
+pub fn signal(sig: string) -> string is
+    let known: [string] = ["HUP", "INT", "QUIT", "KILL", "TERM", "USR1", "USR2", "STOP", "CONT"]
+    let s: string = string_upper(sig)
+    let bare: string = if string_starts_with(s, "SIG") then string_slice(s, 3, string_len(s)) else s end
+    if utils::has(known, bare) || utils::is_number(bare) is return "" end
+    return "unknown signal '" + sig + "'"
 end
