@@ -1,13 +1,15 @@
 [Unit]
-Description=HackerOS Container Runtime API Socket
-PartOf=hco-api.service
+Description=HackerOS Containers REST API socket
+Documentation=https://github.com/HackerOS-Linux-System/HackerOS-Containers
 
 [Socket]
-ListenStream=7443
-# For TLS-only deployments, change to 443 and set HCO_TLS_CERT/HCO_TLS_KEY
-# ListenStream=443
-BindIPv6Only=both
-Service=hco-api.service
+# Loopback only by default. Put a TLS-terminating proxy in front to expose it.
+ListenStream=127.0.0.1:7443
+# One service instance per connection: `hco api-conn` reads one HTTP request
+# from stdin and writes the response to stdout.
+Accept=yes
+MaxConnections=64
+SocketMode=0660
 
 [Install]
 WantedBy=sockets.target
