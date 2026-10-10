@@ -1,51 +1,61 @@
-use "std -> process" from "proc"
-use "std -> fs" from "fs"
-use "std -> json" from "json"
-use "std -> strings" from "str"
+use "bit -> container" from "ctr"
+use "bit -> colors"
 
 mod utils
+mod ui
+mod args
+mod backend
+mod db
 
-pub fn cni_add(network_name: string, container_id: string, netns_path: string) -> string? is
-    if !fs::exists(netns_path) is
-        let created: proc::RunResult = proc::run("ip", ["netns", "add", container_id])
-        if created.exit_code != 0 is return nil end
-    end
-
-    let result: proc::RunResult = proc::run("cnitool", ["add", network_name, netns_path])
-    if result.exit_code != 0 is return nil end
-
-    let parsed: any? = json::parse(result.stdout)
-    if parsed == nil is return nil end
-    let ips: [any] = json::get_array(parsed, "ips")
-    if array_len(ips) == 0 is return "" end
-    let addr: string = json::get_string(ips[0], "address", "")
-    let slash: int = str::find(addr, "/")
-    if slash >= 0 is return str::slice(addr, 0, slash) end
-    return addr
+pub fn conf_dir() -> string is
+    return utils::or_default(env_get("CNI_CONF_DIR"), "/etc/cni/net.d")
 end
 
-pub fn cni_del(network_name: string, container_id: string, netns_path: string) -> bool is
-    let result: proc::RunResult = proc::run("cnitool", ["del", network_name, netns_path])
-    proc::run("ip", ["netns", "del", container_id]) ;; best-effort, ignore result
-    return result.exit_code == 0
+pub fn bin_dir() -> string is
+    return utils::or_default(env_get("CNI_PATH"), "/opt/cni/bin")
 end
 
-pub fn list_networks() -> [string] is
-    let cni_dir: string = "/etc/cni/net.d"
-    if !fs::exists(cni_dir) is return [] end
-
-    let mut networks: [string] = []
-    for entry in fs::list_dir(cni_dir) is
-        if str::ends_with(entry, ".conf") || str::ends_with(entry, ".conflist") is
-            let content: string? = utils::read_file(cni_dir + "/" + entry)
-            if content != nil is
-                let parsed: any? = json::parse(content)
-                if parsed != nil is
-                    let name: string = json::get_string(parsed, "name", "")
-                    if name != "" is networks = array_push(networks, name) end
-                end
-            end
+;; Network names found in the CNI configuration directory.
+pub fn networks() -> [string] is
+    let files: [string] = utils::list_dir(conf_dir())
+    let mut out: [string] = []
+    let mut i: int = 0
+    while i < array_len(files) is
+        if string_ends_with(files[i], ".conflist") || string_ends_with(files[i], ".conf") is
+            let n: string = utils::capture("sed -n 's/.*\"name\"[[:space:]]*:[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p' " + utils::sq(conf_dir() + "/" + files[i]) + " | head -1")
+            if n != "" is out = array_push(out, n) end
         end
+        i += 1
     end
-    return networks
+    return out
+end
+
+pub fn available() -> bool is
+    return utils::tool_exists("cnitool") && utils::is_dir(conf_dir())
+end
+
+fn netns_of(s: ctr::store::Store, id: string) -> string is
+    let pid: int = ctr::container_pid(s, id)
+    if pid <= 0 is return "" end
+    return "/proc/" + to_string(pid) + "/ns/net"
+end
+
+fn cni_env() -> string is
+    return "CNI_PATH=" + utils::sq(bin_dir()) + " NETCONFPATH=" + utils::sq(conf_dir()) + " "
+end
+
+;; hco network attach NETWORK CONTAINER | detach NETWORK CONTAINER
+pub fn attach(s: ctr::store::Store, net: string, ref_text: string, detach: bool) -> int is
+    if !available() is return ui::fail_hint("CNI is not set up on this host", "install cnitool and put network configs into " + conf_dir()) end
+    if !utils::has(networks(), net) is return ui::fail("no CNI network named " + net + " (see: hco network ls)") end
+    let id: string = backend::resolve(s, ref_text)
+    if id == "" is return 1 end
+    let ns: string = netns_of(s, id)
+    if ns == "" is return ui::fail("container is not running") end
+    let verb: string = if detach then "del" else "add" end
+    let out: string = utils::capture(cni_env() + "cnitool " + verb + " " + utils::sq(net) + " " + utils::sq(ns) + " 2>&1")
+    if string_contains(string_lower(out), "error") is return ui::fail("cnitool " + verb + " failed: " + out) end
+    db::event(s, "network", net, verb + " " + utils::short_id(id))
+    ui::success((if detach then "detached " else "attached " end) + colors::bold(backend::name_of(s, id)) + (if detach then " from " else " to " end) + colors::bold(net))
+    return 0
 end
