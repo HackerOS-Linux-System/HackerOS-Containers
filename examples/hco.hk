@@ -1,0 +1,17 @@
+[stack]
+-> name => demo
+
+[db]
+-> image => postgres:16-alpine
+-> env => POSTGRES_PASSWORD=change-me
+-> volume => pgdata:/var/lib/postgresql/data
+-> restart => always
+-> memory => 512m
+-> health_cmd => pg_isready -U postgres
+
+[web]
+-> image => nginx:alpine
+-> publish => 8080:80
+-> depends_on => db
+-> preset => web
+-> restart => on-failure
