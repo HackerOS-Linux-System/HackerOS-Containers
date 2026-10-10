@@ -1,0 +1,173 @@
+use "bit -> container" from "ctr"
+use "bit -> colors"
+
+mod utils
+mod ui
+mod args
+mod backend
+mod config
+mod container
+mod db
+mod validation
+
+fn stack_file(p: args::Parsed) -> string is
+    let f: string = args::get(p, ["-f", "--file"])
+    if f != "" is return f end
+    if file_exists("hco.hk") is return "hco.hk" end
+    return "Stack.hk"
+end
+
+fn stack_name(entries: [string], file: string) -> string is
+    let n: string = config::get(entries, "stack", "name")
+    if n != "" is return n end
+    return utils::basename(utils::capture("pwd"))
+end
+
+;; Services (every section except [stack]) ordered so dependencies come first.
+fn ordered(entries: [string]) -> [string] is
+    let all: [string] = utils::without(config::sections(entries), "stack")
+    let mut done: [string] = []
+    let mut guard: int = 0
+    while array_len(done) < array_len(all) && guard < 64 is
+        let mut i: int = 0
+        while i < array_len(all) is
+            if !utils::has(done, all[i]) is
+                let deps: [string] = config::all(entries, all[i], "depends_on")
+                let mut ready: bool = true
+                let mut d: int = 0
+                while d < array_len(deps) is
+                    if utils::has(all, deps[d]) && !utils::has(done, deps[d]) is ready = false end
+                    d += 1
+                end
+                if ready is done = array_push(done, all[i]) end
+            end
+            i += 1
+        end
+        guard += 1
+    end
+    return done
+end
+
+fn service_argv(entries: [string], svc: string, stack: string) -> [string] is
+    let mut a: [string] = ["-d", "--name", stack + "-" + svc, "--pod", stack]
+    let simple: [string] = ["hostname|--hostname", "workdir|--workdir", "user|--user", "network|--network", "memory|--memory", "cpus|--cpus", "restart|--restart", "preset|--preset", "seccomp|--seccomp", "health_cmd|--health-cmd", "health_interval|--health-interval", "entrypoint|--entrypoint"]
+    let mut i: int = 0
+    while i < array_len(simple) is
+        let v: string = config::get(entries, svc, utils::head_before(simple[i], "|"))
+        if v != "" is
+            a = array_push(a, utils::tail_after(simple[i], "|"))
+            a = array_push(a, v)
+        end
+        i += 1
+    end
+    let lists: [string] = ["env|-e", "volume|-v", "publish|-p", "label|-l", "cap_add|--cap-add", "cap_drop|--cap-drop"]
+    let mut k: int = 0
+    while k < array_len(lists) is
+        let vals: [string] = config::all(entries, svc, utils::head_before(lists[k], "|"))
+        let mut j: int = 0
+        while j < array_len(vals) is
+            a = array_push(a, utils::tail_after(lists[k], "|"))
+            a = array_push(a, vals[j])
+            j += 1
+        end
+        k += 1
+    end
+    if config::get(entries, svc, "read_only") == "true" is a = array_push(a, "--read-only") end
+    a = array_push(a, config::get(entries, svc, "image"))
+    let cmd: string = config::get(entries, svc, "command")
+    if cmd != "" is
+        let words: [string] = string_split(cmd, " ")
+        let mut w: int = 0
+        while w < array_len(words) is
+            if words[w] != "" is a = array_push(a, words[w]) end
+            w += 1
+        end
+    end
+    return a
+end
+
+;; hco up [-f FILE]
+pub fn cmd_up(s: ctr::store::Store, argv: [string]) -> int is
+    let p = args::parse(argv, ["-f", "--file"], false)
+    let file: string = stack_file(p)
+    if !file_exists(file) is return ui::fail_hint("stack file not found: " + file, "create hco.hk (see: hco help stack)") end
+    let entries: [string] = config::load(file)
+    let stack: string = stack_name(entries, file)
+    let bad: string = validation::name(stack)
+    if bad != "" is return ui::fail("stack name: " + bad) end
+    let order: [string] = ordered(entries)
+    if array_len(order) == 0 is return ui::fail("no services in " + file) end
+    ui::title("stack " + stack)
+    ui::out("  " + ui::muted(to_string(array_len(order)) + " services from " + file))
+    if !db::pod_exists(s, stack) is
+        db::pod_set(s, stack, "created", to_string(utils::now_unix()))
+        db::event(s, "pod", stack, "create (stack)")
+    end
+    let mut failed: int = 0
+    let mut i: int = 0
+    while i < array_len(order) is
+        let svc: string = order[i]
+        let name: string = stack + "-" + svc
+        ui::step(i + 1, array_len(order), svc)
+        if config::get(entries, svc, "image") == "" is
+            ui::error("service " + svc + " has no image")
+            failed += 1
+        else is
+            let existing: string = ctr::container_find(s, name)
+            if existing != "" is
+                if backend::is_running(s, existing) is
+                    ui::info(name + " already running")
+                else is
+                    if ctr::container_start(s, existing, false) == 0 is
+                        ui::success("started " + colors::bold(name))
+                    else is
+                        ui::error("cannot start " + name)
+                        failed += 1
+                    end
+                end
+            else is
+                let pa = args::parse(service_argv(entries, svc, stack), container::run_valued(), true)
+                let id: string = container::create_from(s, pa, true)
+                if id == "" is
+                    failed += 1
+                else is
+                    if ctr::container_start(s, id, false) == 0 is
+                        ui::success("created " + colors::bold(name) + " " + ui::muted(utils::short_id(id)))
+                    else is
+                        ui::error(name + " did not start (hco logs " + name + ")")
+                        failed += 1
+                    end
+                end
+            end
+        end
+        i += 1
+    end
+    if failed > 0 is return 1 end
+    ui::blank()
+    ui::hint("status: hco ps --pod " + stack + "   stop: hco down" + if file != "hco.hk" then " -f " + file else "" end)
+    return 0
+end
+
+;; hco down [-f FILE] [-v]
+pub fn cmd_down(s: ctr::store::Store, argv: [string]) -> int is
+    let p = args::parse(argv, ["-f", "--file"], false)
+    let file: string = stack_file(p)
+    if !file_exists(file) is return ui::fail("stack file not found: " + file) end
+    let entries: [string] = config::load(file)
+    let stack: string = stack_name(entries, file)
+    let order: [string] = ordered(entries)
+    let mut i: int = array_len(order) - 1
+    while i >= 0 is
+        let id: string = ctr::container_find(s, stack + "-" + order[i])
+        if id != "" is
+            ctr::container_stop(s, id, 10)
+            ctr::container_remove(s, id, true)
+            db::meta_drop(s, id)
+            ui::success("removed " + colors::bold(stack + "-" + order[i]))
+        end
+        i -= 1
+    end
+    if db::pod_exists(s, stack) is db::pod_drop(s, stack) end
+    db::event(s, "pod", stack, "down")
+    return 0
+end
