@@ -1,0 +1,104 @@
+mod utils
+
+pub struct Parsed is
+    pub pa_kv:  [string]     ;; "flag=value"; boolean flags carry value "true"
+    pub pa_pos: [string]
+end
+
+pub fn parse(argv: [string], valued: [string], stop_at_pos: bool) -> Parsed is
+    let mut kv: [string] = []
+    let mut pos: [string] = []
+    let mut i: int = 0
+    while i < array_len(argv) is
+        let a: string = argv[i]
+        if a == "--" is
+            i += 1
+            while i < array_len(argv) is
+                pos = array_push(pos, argv[i])
+                i += 1
+            end
+            break
+        end
+        if string_starts_with(a, "-") && string_len(a) > 1 is
+            let eq: int = string_find(a, "=")
+            if string_starts_with(a, "--") && eq > 0 is
+                kv = array_push(kv, string_slice(a, 0, eq) + "=" + string_slice(a, eq + 1, string_len(a)))
+            else if utils::has(valued, a) is
+                if i + 1 < array_len(argv) is
+                    kv = array_push(kv, a + "=" + argv[i + 1])
+                    i += 1
+                else is
+                    kv = array_push(kv, a + "=")
+                end
+            else is
+                kv = array_push(kv, a + "=true")
+            end
+        else is
+            pos = array_push(pos, a)
+            if stop_at_pos is
+                i += 1
+                while i < array_len(argv) is
+                    pos = array_push(pos, argv[i])
+                    i += 1
+                end
+                break
+            end
+        end
+        i += 1
+    end
+    return Parsed { pa_kv: kv, pa_pos: pos }
+end
+
+pub fn all(p: Parsed, names: [string]) -> [string] is
+    let mut out: [string] = []
+    let mut i: int = 0
+    while i < array_len(p.pa_kv) is
+        if utils::has(names, utils::head_before(p.pa_kv[i], "=")) is
+            out = array_push(out, utils::tail_after(p.pa_kv[i], "="))
+        end
+        i += 1
+    end
+    return out
+end
+
+pub fn get(p: Parsed, names: [string]) -> string is
+    let v: [string] = all(p, names)
+    if array_len(v) == 0 is return "" end
+    return v[array_len(v) - 1]
+end
+
+pub fn flag(p: Parsed, names: [string]) -> bool is
+    let v: [string] = all(p, names)
+    if array_len(v) == 0 is return false end
+    let last: string = v[array_len(v) - 1]
+    return last == "true" || last == "1" || last == "yes"
+end
+
+pub fn pos(p: Parsed) -> [string] is
+    return p.pa_pos
+end
+
+pub fn pos_at(p: Parsed, i: int) -> string is
+    if i < array_len(p.pa_pos) is return p.pa_pos[i] end
+    return ""
+end
+
+pub fn rest_from(p: Parsed, i: int) -> [string] is
+    let mut out: [string] = []
+    let mut k: int = i
+    while k < array_len(p.pa_pos) is
+        out = array_push(out, p.pa_pos[k])
+        k += 1
+    end
+    return out
+end
+
+pub fn argv_tail(argv: [string], from: int) -> [string] is
+    let mut out: [string] = []
+    let mut i: int = from
+    while i < array_len(argv) is
+        out = array_push(out, argv[i])
+        i += 1
+    end
+    return out
+end
