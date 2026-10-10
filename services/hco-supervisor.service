@@ -1,0 +1,16 @@
+[Unit]
+Description=HackerOS Containers restart-policy supervisor
+Documentation=https://github.com/HackerOS-Linux-System/HackerOS-Containers
+After=network-online.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/bin/hco --no-color supervise --interval 5
+Restart=on-failure
+RestartSec=5s
+SyslogIdentifier=hco-supervisor
+
+[Install]
+WantedBy=multi-user.target
+  
