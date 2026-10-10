@@ -1,13 +1,56 @@
-use "std -> tls" from "tls"
-use "std -> fs" from "fs"
+use "bit -> container" from "ctr"
+use "bit -> colors"
 
-pub fn build_server_config(cert_path: string, key_path: string) -> any? is
-    if !fs::exists(cert_path) is return nil end
-    if !fs::exists(key_path) is return nil end
-    return tls::load_cert(cert_path, key_path)
+mod utils
+mod ui
+mod args
+mod db
+
+pub fn dir(s: ctr::store::Store) -> string is
+    return db::dir(s) + "/tls"
 end
 
-pub fn tls_files_present(cert: string, key: string) -> bool is
-    if cert == "" || key == "" is return false end
-    return fs::exists(cert) && fs::exists(key)
+pub fn cert_path(s: ctr::store::Store) -> string is
+    return utils::or_default(env_get("HCO_TLS_CERT"), dir(s) + "/server.crt")
+end
+
+pub fn key_path(s: ctr::store::Store) -> string is
+    return utils::or_default(env_get("HCO_TLS_KEY"), dir(s) + "/server.key")
+end
+
+pub fn present(s: ctr::store::Store) -> bool is
+    return file_exists(cert_path(s)) && file_exists(key_path(s))
+end
+
+;; hco tls init [--cn NAME] [--days N] [--force] | hco tls show
+pub fn cmd_tls(s: ctr::store::Store, argv: [string]) -> int is
+    if array_len(argv) == 0 is
+        ui::title("hco tls")
+        ui::help_cmd("init", "[--cn NAME]", "create a self-signed certificate")
+        ui::help_cmd("show", "", "show the current certificate")
+        return 0
+    end
+    let p = args::parse(args::argv_tail(argv, 1), ["--cn", "--days"], false)
+    if argv[0] == "init" is
+        if !utils::tool_exists("openssl") is return ui::fail("openssl is required") end
+        if present(s) && !args::flag(p, ["--force"]) is return ui::fail_hint("a certificate already exists: " + cert_path(s), "use --force to replace it") end
+        let cn: string = utils::or_default(args::get(p, ["--cn"]), utils::hostname())
+        let days: string = utils::or_default(args::get(p, ["--days"]), "825")
+        utils::mkdir_p(dir(s))
+        ui::step(1, 2, "generating key and certificate for " + colors::bold(cn))
+        let rc: int = utils::quiet("openssl req -x509 -newkey rsa:3072 -nodes -days " + days + " -subj " + utils::sq("/CN=" + cn) + " -keyout " + utils::sq(key_path(s)) + " -out " + utils::sq(cert_path(s)))
+        if rc != 0 is return ui::fail("openssl failed") end
+        utils::quiet("chmod 600 " + utils::sq(key_path(s)))
+        ui::step(2, 2, "done")
+        ui::success("certificate: " + colors::bold(cert_path(s)))
+        ui::success("private key: " + colors::bold(key_path(s)))
+        return 0
+    end
+    if argv[0] == "show" is
+        if !present(s) is return ui::fail_hint("no certificate yet", "create one with: hco tls init") end
+        ui::title("certificate")
+        write(utils::capture("openssl x509 -in " + utils::sq(cert_path(s)) + " -noout -subject -issuer -dates -fingerprint -sha256"))
+        return 0
+    end
+    return ui::fail("unknown tls command: " + argv[0])
 end
