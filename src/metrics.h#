@@ -1,118 +1,164 @@
-use "std -> fs" from "fs"
-use "std -> strings" from "str"
-use "std -> time" from "time"
+use "bit -> container" from "ctr"
+use "bit -> colors"
 
-pub struct ContainerStats is
-    pub memory_bytes:      int
-    pub memory_limit:      int
-    pub cpu_percent:       float
-    pub pids:              int
-    pub net_rx_bytes:      int
-    pub net_tx_bytes:      int
+mod utils
+mod ui
+mod args
+mod backend
+mod db
+
+fn cg(id: string) -> string is
+    return "/sys/fs/cgroup/container/" + id
 end
 
-;; [FIXED] `memory_limit` and `cpu_percent` collide with field names on
-;; `Specs`, `CreateOptions` and `SandboxSpec` (different modules); `pids`
-;; is unique but included for consistency. Same-module accessors, same
-;; reasoning as db.h#'s row_* functions.
-pub fn stats_memory_bytes(s: ContainerStats) -> int is return s.memory_bytes end
-pub fn stats_memory_limit(s: ContainerStats) -> int is return s.memory_limit end
-pub fn stats_cpu_percent(s: ContainerStats) -> float is return s.cpu_percent end
-pub fn stats_pids(s: ContainerStats) -> int is return s.pids end
-pub fn stats_net_rx_bytes(s: ContainerStats) -> int is return s.net_rx_bytes end
-pub fn stats_net_tx_bytes(s: ContainerStats) -> int is return s.net_tx_bytes end
-
-fn cgroup_path(container_id: string) -> string is
-    return "/sys/fs/cgroup/hco/" + container_id
+pub fn mem_current(id: string) -> int is
+    return utils::atoi(utils::read_trim(cg(id) + "/memory.current"))
 end
 
-fn read_int_file(path: string) -> int is
-    if !fs::exists(path) is return 0 end
-    let content: string = str::trim(fs::read(path))
-    if content == "max" is return -1 end
-    return conv::str_to_int(content)
+;; Memory limit in bytes, 0 when unlimited.
+pub fn mem_limit(id: string) -> int is
+    let v: string = utils::read_trim(cg(id) + "/memory.max")
+    if v == "max" || v == "" is return 0 end
+    return utils::atoi(v)
 end
 
-fn read_cpu_usage_usec(container_id: string) -> int is
-    let stat_path: string = cgroup_path(container_id) + "/cpu.stat"
-    if !fs::exists(stat_path) is return 0 end
-    for line in str::split(fs::read(stat_path), "\n") is
-        if str::starts_with(line, "usage_usec") is
-            return conv::str_to_int(str::trim(str::slice(line, 10, str::len(line))))
+pub fn pids_current(id: string) -> int is
+    return utils::atoi(utils::read_trim(cg(id) + "/pids.current"))
+end
+
+;; Total CPU time in microseconds.
+pub fn cpu_usec(id: string) -> int is
+    return utils::atoi(utils::capture("grep '^usage_usec' " + utils::sq(cg(id) + "/cpu.stat") + " 2>/dev/null | cut -d' ' -f2"))
+end
+
+fn pct_of(part: int, whole: int) -> int is
+    if whole <= 0 is return 0 end
+    return (part * 100) / whole
+end
+
+;; hco stats [-w] [CONTAINER...]   (one-second CPU sample; -w keeps refreshing)
+pub fn cmd_stats(s: ctr::store::Store, argv: [string]) -> int is
+    let p = args::parse(argv, [], false)
+    let mut ids: [string] = []
+    let named: [string] = args::pos(p)
+    if array_len(named) == 0 is
+        ids = backend::ids(s, true)
+    else is
+        let mut i: int = 0
+        while i < array_len(named) is
+            let id: string = backend::resolve(s, named[i])
+            if id == "" is return 1 end
+            ids = array_push(ids, id)
+            i += 1
         end
+    end
+    if array_len(ids) == 0 is
+        ui::info("no running containers")
+        return 0
+    end
+    if ctr::host_info().hi_cgroup != 2 is
+        ui::warn("cgroup v1 host: only memory figures are available")
+    end
+    let watch: bool = args::flag(p, ["-w", "--watch"])
+    let mut round: int = 0
+    while true is
+        let mut before: [int] = []
+        let mut k: int = 0
+        while k < array_len(ids) is
+            before = array_push(before, cpu_usec(ids[k]))
+            k += 1
+        end
+        let t0: int = utils::now_ms()
+        sleep_ms(1000)
+        let dt: int = utils::max_int((utils::now_ms() - t0) * 1000, 1)
+        let mut t = ui::table(["NAME", "CPU", "MEMORY", "USED / LIMIT", "PIDS"])
+        let mut j: int = 0
+        while j < array_len(ids) is
+            let cpu: int = pct_of(cpu_usec(ids[j]) - before[j], dt)
+            let mem: int = mem_current(ids[j])
+            let lim: int = mem_limit(ids[j])
+            let host_mem: int = utils::atoi(utils::capture("grep '^MemTotal' /proc/meminfo | tr -s ' ' | cut -d' ' -f2")) * 1024
+            let scale: int = if lim > 0 then lim else host_mem end
+            t = ui::add_row(t, [colors::bold(backend::name_of(s, ids[j])), ui::usage_bar(cpu, 14), ui::usage_bar(pct_of(mem, scale), 14), utils::human_bytes(mem) + " / " + if lim > 0 then utils::human_bytes(lim) else "∞" end, to_string(pids_current(ids[j]))])
+            j += 1
+        end
+        if watch && round > 0 is utils::quiet("printf '\\033[2J\\033[H'") end
+        if watch is utils::run("printf '\\033[2J\\033[H'") end
+        ui::print_table(t)
+        round += 1
+        if !watch is break end
     end
     return 0
 end
 
-;; [FIXED] two-sample delta measurement — see module doc comment.
-fn read_cpu_percent(container_id: string, sample_ms: int) -> float is
-    let usage_before: int = read_cpu_usage_usec(container_id)
-    let t_before: int = time::now_millis()
-    time::sleep_ms(sample_ms)
-    let usage_after: int = read_cpu_usage_usec(container_id)
-    let t_after: int = time::now_millis()
-
-    let wall_usec: int = (t_after - t_before) * 1000
-    if wall_usec <= 0 is return 0.0 end
-    let delta_usec: int = usage_after - usage_before
-    return (int_to_float(delta_usec) / int_to_float(wall_usec)) * 100.0
+;; hco top CONTAINER — processes inside the container's cgroup.
+pub fn cmd_top(s: ctr::store::Store, argv: [string]) -> int is
+    if array_len(argv) != 1 is return ui::fail("usage: hco top CONTAINER") end
+    let id: string = backend::resolve(s, argv[0])
+    if id == "" is return 1 end
+    if !backend::is_running(s, id) is return ui::fail("container is not running") end
+    let pids: string = utils::capture("cat " + utils::sq(cg(id) + "/cgroup.procs") + " 2>/dev/null | tr '\\n' ',' | sed 's/,$//'")
+    if pids == "" is return ui::fail("cannot read the container's cgroup (is the host cgroup v2?)") end
+    ui::title("processes of " + backend::name_of(s, id))
+    write(utils::capture("ps -o pid=PID,ppid=PPID,user=USER,pcpu=%CPU,pmem=%MEM,etime=TIME,args=COMMAND -p " + pids))
+    return 0
 end
 
-fn read_net_bytes(container_id: string) -> (int, int) is
-    let veth: string = "veth" + container_id
-    let rx_path: string = "/sys/class/net/" + veth + "/statistics/rx_bytes"
-    let tx_path: string = "/sys/class/net/" + veth + "/statistics/tx_bytes"
-    return (read_int_file(rx_path), read_int_file(tx_path))
+;; ── Prometheus ───────────────────────────────────────────────────────────────
+
+fn lb() -> string is
+    return "{"
 end
 
-pub fn collect_stats(container_id: string, pid: int) -> ContainerStats is
-    let base: string = cgroup_path(container_id)
-    let memory_bytes: int = read_int_file(base + "/memory.current")
-    let memory_limit: int = read_int_file(base + "/memory.max")
-    let pids: int = read_int_file(base + "/pids.current")
-    let cpu_percent: float = read_cpu_percent(container_id, 100)
-    let net: (int, int) = read_net_bytes(container_id)
-
-    return ContainerStats {
-        memory_bytes: memory_bytes,
-        memory_limit: memory_limit,
-        cpu_percent: cpu_percent,
-        pids: pids,
-        net_rx_bytes: net.0,
-        net_tx_bytes: net.1
-    }
+fn rb() -> string is
+    return "}"
 end
 
-;; [EXPANDED] the Rust version only ever rendered stats for a single
-;; container at a time via the API; this adds a whole-fleet Prometheus
-;; `/metrics` exporter (used by api.h#'s new `/metrics` route) so hco can
-;; be scraped directly instead of needing a cAdvisor-style sidecar.
-pub fn render_prometheus(containers: [(string, string, ContainerStats)]) -> string is
-    let mut out: string = ""
-    out += "# HELP hco_container_memory_bytes Current memory usage in bytes\n"
-    out += "# TYPE hco_container_memory_bytes gauge\n"
-    for c in containers is
-        out += "hco_container_memory_bytes{id=\"" + c.0 + "\",name=\"" + c.1 + "\"} " + to_string(c.2.memory_bytes) + "\n"
+fn label(v: string) -> string is
+    return string_replace(string_replace(v, "\\", "\\\\"), "\"", "\\\"")
+end
+
+;; Prometheus text format, version 0.0.4.
+pub fn prometheus(s: ctr::store::Store) -> string is
+    let all: [ctr::runtime::ContainerInfo] = ctr::container_list(s)
+    let mut out: [string] = []
+    out = array_push(out, "# HELP hco_containers Number of containers by state.")
+    out = array_push(out, "# TYPE hco_containers gauge")
+    let mut running: int = 0
+    let mut i: int = 0
+    while i < array_len(all) is
+        if all[i].ci_status == "running" is running += 1 end
+        i += 1
     end
-    out += "# HELP hco_container_cpu_percent Instantaneous CPU usage percentage\n"
-    out += "# TYPE hco_container_cpu_percent gauge\n"
-    for c in containers is
-        out += "hco_container_cpu_percent{id=\"" + c.0 + "\",name=\"" + c.1 + "\"} " + float_to_string(c.2.cpu_percent) + "\n"
+    out = array_push(out, "hco_containers" + lb() + "state=\"running\"" + rb() + " " + to_string(running))
+    out = array_push(out, "hco_containers" + lb() + "state=\"total\"" + rb() + " " + to_string(array_len(all)))
+    out = array_push(out, "# HELP hco_images Number of images in the store.")
+    out = array_push(out, "# TYPE hco_images gauge")
+    out = array_push(out, "hco_images " + to_string(array_len(ctr::image_list(s))))
+    out = array_push(out, "# HELP hco_container_up 1 when the container is running.")
+    out = array_push(out, "# TYPE hco_container_up gauge")
+    out = array_push(out, "# HELP hco_container_memory_bytes Memory used by the container.")
+    out = array_push(out, "# TYPE hco_container_memory_bytes gauge")
+    out = array_push(out, "# HELP hco_container_cpu_seconds_total CPU time used by the container.")
+    out = array_push(out, "# TYPE hco_container_cpu_seconds_total counter")
+    out = array_push(out, "# HELP hco_container_pids Processes in the container.")
+    out = array_push(out, "# TYPE hco_container_pids gauge")
+    let mut k: int = 0
+    while k < array_len(all) is
+        let c: ctr::runtime::ContainerInfo = all[k]
+        let lbl: string = lb() + "id=\"" + utils::short_id(c.ci_id) + "\",name=\"" + label(c.ci_name) + "\",image=\"" + label(c.ci_image) + "\"" + rb()
+        out = array_push(out, "hco_container_up" + lbl + " " + if c.ci_status == "running" then "1" else "0" end)
+        if c.ci_status == "running" is
+            out = array_push(out, "hco_container_memory_bytes" + lbl + " " + to_string(mem_current(c.ci_id)))
+            out = array_push(out, "hco_container_cpu_seconds_total" + lbl + " " + to_string(cpu_usec(c.ci_id) / 1000000))
+            out = array_push(out, "hco_container_pids" + lbl + " " + to_string(pids_current(c.ci_id)))
+        end
+        k += 1
     end
-    out += "# HELP hco_container_pids Number of processes/threads in the container\n"
-    out += "# TYPE hco_container_pids gauge\n"
-    for c in containers is
-        out += "hco_container_pids{id=\"" + c.0 + "\",name=\"" + c.1 + "\"} " + to_string(c.2.pids) + "\n"
-    end
-    out += "# HELP hco_container_net_rx_bytes Bytes received on the container's veth\n"
-    out += "# TYPE hco_container_net_rx_bytes counter\n"
-    for c in containers is
-        out += "hco_container_net_rx_bytes{id=\"" + c.0 + "\",name=\"" + c.1 + "\"} " + to_string(c.2.net_rx_bytes) + "\n"
-    end
-    out += "# HELP hco_container_net_tx_bytes Bytes sent on the container's veth\n"
-    out += "# TYPE hco_container_net_tx_bytes counter\n"
-    for c in containers is
-        out += "hco_container_net_tx_bytes{id=\"" + c.0 + "\",name=\"" + c.1 + "\"} " + to_string(c.2.net_tx_bytes) + "\n"
-    end
-    return out
+    return utils::join(out, "\n") + "\n"
+end
+
+pub fn cmd_metrics(s: ctr::store::Store) -> int is
+    ui::out(prometheus(s))
+    return 0
 end
