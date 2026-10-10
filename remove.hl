@@ -1,6 +1,7 @@
-^> systemctl stop hco-api.socket hco-api.service
-^> systemctl disable hco-api.socket hco-api.service
-^> rm -f /etc/systemd/system/hco-api.service
+^> systemctl stop hco-api.socket hco-supervisor.service
+^> systemctl disable hco-api.socket hco-supervisor.service
+^> rm -f /etc/systemd/system/hco-api@.service
 ^> rm -f /etc/systemd/system/hco-api.socket
+^> rm -f /etc/systemd/system/hco-supervisor.service
 ^> systemctl daemon-reload
-^> rm -rf /usr/bin/hco
+^> rm -f /usr/bin/hco /etc/bash_completion.d/hco
