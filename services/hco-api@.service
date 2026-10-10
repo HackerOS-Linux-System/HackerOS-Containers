@@ -1,63 +1,28 @@
 [Unit]
-Description=HackerOS Container Runtime API
-Documentation=https://github.com/hackeros/hco
+Description=HackerOS Containers REST API connection handler
+Documentation=https://github.com/HackerOS-Linux-System/HackerOS-Containers
+# Started by hco-api.socket (Accept=yes), so this unit is instantiated per connection:
+# install it as hco-api@.service.
 After=network-online.target
-Wants=network-online.target
-# Optional: use socket activation unit instead
-# Requires=hco-api.socket
 
 [Service]
-Type=notify
-NotifyAccess=main
-
-# Run as root (required for namespaces, cgroups, overlayfs)
+Type=simple
 User=root
 Group=root
-
-ExecStartPre=/usr/local/bin/hco ls
-# NOTE: [FIXED] the H# port's CLI uses `hco serve --bind ... --tls-cert
-# ... --tls-key ...` (see main.h#) instead of the old Rust binary's
-# `hco api --api-addr ...`; the previous unit file still referenced the
-# retired flag names and would have failed to start against this build.
-ExecStart=/usr/local/bin/hco serve \
-    --bind ${HCO_API_ADDR:-0.0.0.0:7443} \
-    ${HCO_TLS_CERT:+--tls-cert} ${HCO_TLS_CERT} \
-    ${HCO_TLS_KEY:+--tls-key}  ${HCO_TLS_KEY} \
-    --systemd-socket
-
 EnvironmentFile=-/etc/hco/hco.env
-
-# Restart policy
-Restart=on-failure
-RestartSec=5s
-StartLimitIntervalSec=60s
-StartLimitBurst=5
-
-# Runtime directories
-RuntimeDirectory=hackeros
-StateDirectory=hackeros
-LogsDirectory=hackeros
-ConfigurationDirectory=hco
-
-# Resource limits
-LimitNOFILE=65536
-LimitNPROC=32768
-TasksMax=8192
-
-# Security hardening
-# NOTE: namespaces require some of these to be relaxed
-NoNewPrivileges=no          # must allow for SUID / capabilities
-PrivateTmp=no               # containers share /tmp patterns
-PrivateDevices=no           # containers need /dev access
-ProtectHome=read-only
-ProtectSystem=no            # must write to /var/lib, /var/run, /sys/fs/cgroup
-CapabilityBoundingSet=CAP_SYS_ADMIN CAP_NET_ADMIN CAP_MKNOD CAP_SETUID CAP_SETGID CAP_CHOWN CAP_DAC_OVERRIDE CAP_SYS_CHROOT CAP_SYS_PTRACE
-AmbientCapabilities=CAP_SYS_ADMIN CAP_NET_ADMIN CAP_MKNOD CAP_SETUID CAP_SETGID CAP_CHOWN CAP_DAC_OVERRIDE CAP_SYS_CHROOT
-
-# Logging
-StandardOutput=journal
+# Bearer token: $HCO_API_TOKEN, or the file written by `hco api token`.
+ExecStart=/usr/bin/hco api-conn
+StandardInput=socket
+StandardOutput=socket
 StandardError=journal
 SyslogIdentifier=hco-api
+TimeoutStopSec=15
 
-[Install]
-WantedBy=multi-user.target
+# The container runtime needs namespaces, cgroups and mounts, so the sandbox is
+# deliberately loose; the API itself only accepts authenticated requests.
+NoNewPrivileges=no
+PrivateTmp=no
+PrivateDevices=no
+ProtectSystem=no
+LimitNOFILE=65536
+TasksMax=8192
