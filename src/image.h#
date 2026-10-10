@@ -1,135 +1,263 @@
-use "std -> process" from "proc"
-use "std -> fs" from "fs"
-use "std -> path" from "path"
-use "std -> crypto" from "crypto"
-use "std -> log" from "log"
-use "std -> strings" from "str"
+use "bit -> container" from "ctr"
+use "bit -> colors"
 
-mod sys_ffi
+mod utils
+mod ui
+mod args
+mod backend
+mod db
 
-const IMAGE_CACHE_DIR: string = "/var/lib/hco/images"
-const BUNDLE_ROOT:     string = "/var/lib/hco/bundles"
-
-pub struct ImageRef is
-    pub raw:  string
-    pub repo: string
-    pub tag:  string
+fn short_created(c: string) -> string is
+    if string_len(c) > 19 is return string_replace(string_slice(c, 0, 19), "T", " ") end
+    return c
 end
 
-pub fn parse_image_ref(raw: string) -> ImageRef is
-    let colon: int = str::find(raw, ":")
-    if colon < 0 is return ImageRef { raw: raw, repo: raw, tag: "latest" } end
-    return ImageRef { raw: raw, repo: str::slice(raw, 0, colon), tag: str::slice(raw, colon + 1, str::len(raw)) }
+fn name_cell(names: [string]) -> string is
+    if array_len(names) == 0 is return colors::theme::muted("<none>") end
+    return colors::bold(names[0])
 end
 
-fn cache_key(image: ImageRef) -> string is
-    return str::replace(str::replace(image.repo, "/", "_"), ":", "_") + "_" + image.tag
-end
-
-;; Full-tarball digest — see [FIXED] note in the module doc comment.
-fn compute_digest(tarball_path: string) -> string is
-    return crypto::sha256_file(tarball_path)
-end
-
-pub fn is_cached(image: ImageRef) -> bool is
-    let dir: string = IMAGE_CACHE_DIR + "/" + cache_key(image)
-    return fs::exists(dir + "/rootfs") && fs::exists(dir + "/digest")
-end
-
-pub fn pull_image(image: ImageRef) -> string? is
-    let key: string = cache_key(image)
-    let dest_dir: string = IMAGE_CACHE_DIR + "/" + key
-
-    if is_cached(image) is
-        log::info("Using cached image " + image.raw)
-        return dest_dir + "/rootfs"
-    end
-
-    fs::mkdir_all(dest_dir)
-    let oci_layout: string = dest_dir + "/oci"
-    let pull: proc::RunResult = proc::run("skopeo",
-        ["copy", "docker://" + image.raw, "oci:" + oci_layout + ":" + image.tag])
-    if pull.exit_code != 0 is
-        log::error("skopeo copy failed for " + image.raw + ": " + pull.stderr)
-        return nil
-    end
-
-    let rootfs_dir: string = dest_dir + "/rootfs"
-    if fs::exists(rootfs_dir) is fs::remove_all(rootfs_dir) end
-    fs::mkdir_all(rootfs_dir)
-
-    let unpack: proc::RunResult = proc::run("umoci",
-        ["unpack", "--image", oci_layout + ":" + image.tag, rootfs_dir + "-bundle"])
-    if unpack.exit_code != 0 is
-        log::error("umoci unpack failed for " + image.raw + ": " + unpack.stderr)
-        return nil
-    end
-
-    ;; umoci lays out an OCI runtime bundle (config.json + rootfs/); we
-    ;; only need the extracted rootfs tree itself.
-    fs::remove_all(rootfs_dir)
-    fs::rename(rootfs_dir + "-bundle/rootfs", rootfs_dir)
-    fs::remove_all(rootfs_dir + "-bundle")
-
-    let tarball_for_digest: string = oci_layout + "/index.json"
-    let digest: string = compute_digest(tarball_for_digest)
-    fs::write(dest_dir + "/digest", digest)
-
-    log::info("Pulled image " + image.raw + " (digest " + str::slice(digest, 0, 12) + ")")
-    return rootfs_dir
-end
-
-;; Create a fresh, independent bundle directory (rootfs copy-on-write via
-;; overlayfs) for a container instance so multiple containers can share
-;; one cached image without corrupting each other's writes.
-pub fn create_bundle(container_id: string, image: ImageRef) -> string? is
-    let rootfs: string? = pull_image(image)
-    if rootfs == nil is return nil end
-
-    let bundle_dir: string = BUNDLE_ROOT + "/" + container_id
-    let upper: string = bundle_dir + "/upper"
-    let work: string = bundle_dir + "/work"
-    let merged: string = bundle_dir + "/rootfs"
-
-    fs::mkdir_all(upper)
-    fs::mkdir_all(work)
-    fs::mkdir_all(merged)
-
-    let opts: string = "lowerdir=" + rootfs + ",upperdir=" + upper + ",workdir=" + work
-    if !sys_ffi::mount_overlay(merged, opts) is
-        log::error("overlayfs mount failed for " + container_id)
-        return nil
-    end
-
-    return bundle_dir
-end
-
-pub fn destroy_bundle(container_id: string) is
-    let bundle_dir: string = BUNDLE_ROOT + "/" + container_id
-    sys_ffi::lazy_unmount(bundle_dir + "/rootfs")
-    if fs::exists(bundle_dir) is fs::remove_all(bundle_dir) end
-end
-
-;; [EXPANDED] the Rust version had no image GC at all — cached image
-;; directories under IMAGE_CACHE_DIR just accumulated forever. This adds
-;; a simple "delete anything not referenced by a running or stopped
-;; container row" sweep, invoked from `hco image prune`.
-pub fn prune_unused(referenced_keys: [string]) -> int is
-    if !fs::exists(IMAGE_CACHE_DIR) is return 0 end
-    let mut removed: int = 0
-    for entry in fs::list_dir(IMAGE_CACHE_DIR) is
-        if !array_contains_str(referenced_keys, entry) is
-            fs::remove_all(IMAGE_CACHE_DIR + "/" + entry)
-            removed += 1
-            log::info("Pruned unused image cache entry: " + entry)
+;; hco images [-q] [-a]
+pub fn cmd_images(s: ctr::store::Store, argv: [string]) -> int is
+    let p = args::parse(argv, [], false)
+    let all: [ctr::image::ImageInfo] = ctr::image_list(s)
+    if args::flag(p, ["-q", "--quiet"]) is
+        let mut i: int = 0
+        while i < array_len(all) is
+            write(utils::short_id(all[i].ii_id))
+            i += 1
         end
+        return 0
     end
-    return removed
+    if array_len(all) == 0 is
+        ui::info("no images yet")
+        ui::hint("pull one with: hco pull alpine:3.20")
+        return 0
+    end
+    let mut t = ui::table(["IMAGE", "ID", "SIZE", "LAYERS", "ARCH", "CREATED"])
+    let mut total: int = 0
+    let mut i2: int = 0
+    while i2 < array_len(all) is
+        let im: ctr::image::ImageInfo = all[i2]
+        t = ui::add_row(t, [name_cell(im.ii_names), colors::theme::code(utils::short_id(im.ii_id)), utils::human_bytes(im.ii_size), to_string(im.ii_layers), im.ii_arch, ui::muted(short_created(im.ii_created))])
+        total = total + im.ii_size
+        i2 += 1
+    end
+    ui::print_table(t)
+    ui::blank()
+    ui::out(ui::muted(to_string(array_len(all)) + " image(s), " + utils::human_bytes(total) + " total"))
+    return 0
 end
 
-fn array_contains_str(arr: [string], v: string) -> bool is
-    for x in arr is
-        if x == v is return true end
+;; hco pull IMAGE...
+pub fn cmd_pull(s: ctr::store::Store, argv: [string]) -> int is
+    let p = args::parse(argv, [], false)
+    let refs: [string] = args::pos(p)
+    if array_len(refs) == 0 is return ui::fail_hint("usage: hco pull IMAGE...", "example: hco pull alpine:3.20") end
+    let mut failed: int = 0
+    let mut i: int = 0
+    while i < array_len(refs) is
+        let bad: string = validation_image(refs[i])
+        if bad != "" is
+            ui::error(bad)
+            failed += 1
+        else is
+            ui::step(i + 1, array_len(refs), "pulling " + colors::bold(refs[i]))
+            let id: string = ctr::image_pull(s, refs[i])
+            if id == "" is
+                ui::error("pull failed: " + refs[i])
+                failed += 1
+            else is
+                ui::success(refs[i] + " " + colors::theme::muted("(" + utils::short_id(id) + ")"))
+                db::event(s, "image", utils::short_id(id), "pull " + refs[i])
+            end
+        end
+        i += 1
     end
-    return false
+    if failed > 0 is return 1 end
+    return 0
+end
+
+fn validation_image(r: string) -> string is
+    if r == "" is return "image reference must not be empty" end
+    if string_contains(r, " ") is return "image reference must not contain spaces" end
+    return ""
+end
+
+;; hco rmi [-f] IMAGE...
+pub fn cmd_rmi(s: ctr::store::Store, argv: [string]) -> int is
+    let p = args::parse(argv, [], false)
+    let force: bool = args::flag(p, ["-f", "--force"])
+    let refs: [string] = args::pos(p)
+    if array_len(refs) == 0 is return ui::fail("usage: hco rmi [-f] IMAGE...") end
+    let mut failed: int = 0
+    let mut i: int = 0
+    while i < array_len(refs) is
+        if ctr::image_remove(s, refs[i], force) is
+            ui::success("removed " + refs[i])
+            db::event(s, "image", refs[i], "remove")
+        else is
+            ui::error("cannot remove " + refs[i] + " (unknown image, or used by a container — try -f)")
+            failed += 1
+        end
+        i += 1
+    end
+    if failed > 0 is return 1 end
+    return 0
+end
+
+;; hco tag SOURCE NEW_NAME
+pub fn cmd_tag(s: ctr::store::Store, argv: [string]) -> int is
+    if array_len(argv) != 2 is return ui::fail("usage: hco tag SOURCE NEW_NAME") end
+    if ctr::image_tag(s, argv[0], argv[1]) is
+        ui::success(argv[0] + " " + colors::theme::muted("→") + " " + argv[1])
+        return 0
+    end
+    return ui::fail("cannot tag " + argv[0])
+end
+
+;; hco image inspect IMAGE [--raw]
+pub fn cmd_inspect(s: ctr::store::Store, argv: [string]) -> int is
+    let p = args::parse(argv, [], false)
+    let r: string = args::pos_at(p, 0)
+    if r == "" is return ui::fail("usage: hco image inspect IMAGE [--raw]") end
+    if backend::resolve_image(s, r) == "" is return 1 end
+    if args::flag(p, ["--raw"]) is
+        let raw: string = ctr::image_inspect(s, r)
+        if utils::tool_exists("jq") is
+            write(utils::capture("printf '%s' " + utils::sq(raw) + " | jq ."))
+        else is
+            write(raw)
+        end
+        return 0
+    end
+    let cfg: ctr::image::ImageConfig = ctr::image_config(s, r)
+    ui::title("image " + r)
+    ui::kv("Id", colors::theme::code(ctr::image_resolve(s, r)))
+    ui::kv("Platform", cfg.ic_os + "/" + cfg.ic_arch)
+    ui::kv("Created", short_created(cfg.ic_created))
+    ui::kv("User", utils::or_default(cfg.ic_user, "root"))
+    ui::kv("Workdir", utils::or_default(cfg.ic_workdir, "/"))
+    ui::kv("Stop signal", utils::or_default(cfg.ic_stopsignal, "SIGTERM"))
+    ui::kv("Entrypoint", utils::or_default(utils::join(cfg.ic_entrypoint, " "), "—"))
+    ui::kv("Cmd", utils::or_default(utils::join(cfg.ic_cmd, " "), "—"))
+    ui::kv_list("Env", cfg.ic_env)
+    ui::kv_list("Ports", cfg.ic_ports)
+    ui::kv_list("Volumes", cfg.ic_volumes)
+    ui::kv_list("Labels", cfg.ic_labels)
+    ui::kv("Layers", to_string(array_len(cfg.ic_diff_ids)))
+    return 0
+end
+
+;; hco history IMAGE
+pub fn cmd_history(s: ctr::store::Store, argv: [string]) -> int is
+    if array_len(argv) != 1 is return ui::fail("usage: hco history IMAGE") end
+    if backend::resolve_image(s, argv[0]) == "" is return 1 end
+    let cfg: ctr::image::ImageConfig = ctr::image_config(s, argv[0])
+    ui::title("history of " + argv[0])
+    let mut i: int = array_len(cfg.ic_history) - 1
+    let mut n: int = 1
+    while i >= 0 is
+        write("  " + colors::theme::muted(colors::util::pad_left(to_string(n), 3)) + "  " + utils::head_before(cfg.ic_history[i], "\n"))
+        n += 1
+        i -= 1
+    end
+    return 0
+end
+
+;; hco build [-t TAG] [-f FILE] [--build-arg K=V]... [--net MODE] [CONTEXT]
+pub fn cmd_build(s: ctr::store::Store, argv: [string]) -> int is
+    let p = args::parse(argv, ["-t", "--tag", "-f", "--file", "--build-arg", "--net", "--network"], false)
+    let ctx: string = utils::or_default(args::pos_at(p, 0), ".")
+    let tag: string = args::get(p, ["-t", "--tag"])
+    let file: string = args::get(p, ["-f", "--file"])
+    let net: string = utils::or_default(args::get(p, ["--net", "--network"]), "host")
+    if !utils::is_dir(ctx) is return ui::fail("build context is not a directory: " + ctx) end
+    ui::step(1, 2, "building from " + colors::bold(ctx) + colors::theme::muted("  (net=" + net + ")"))
+    let id: string = ctr::build_image(s, ctx, file, tag, args::all(p, ["--build-arg"]), net)
+    if id == "" is return ui::fail("build failed") end
+    ui::step(2, 2, "done")
+    ui::success("built " + colors::theme::code(utils::short_id(id)) + if tag != "" then " as " + colors::bold(tag) else "" end)
+    db::event(s, "image", utils::short_id(id), "build " + tag)
+    return 0
+end
+
+;; hco save IMAGE DIR   |   hco load DIR [NAME]   |   hco import TAR NAME
+pub fn cmd_save(s: ctr::store::Store, argv: [string]) -> int is
+    if array_len(argv) != 2 is return ui::fail("usage: hco save IMAGE DIR") end
+    if ctr::image_export(s, argv[0], argv[1]) is
+        ui::success("saved " + argv[0] + " to " + colors::bold(argv[1]))
+        return 0
+    end
+    return ui::fail("cannot export " + argv[0])
+end
+
+pub fn cmd_load(s: ctr::store::Store, argv: [string]) -> int is
+    if array_len(argv) < 1 is return ui::fail("usage: hco load DIR [NAME]") end
+    let name: string = if array_len(argv) > 1 then argv[1] else "" end
+    let id: string = ctr::image_load(s, argv[0], name)
+    if id == "" is return ui::fail("cannot load " + argv[0]) end
+    ui::success("loaded " + colors::theme::code(utils::short_id(id)))
+    return 0
+end
+
+pub fn cmd_import(s: ctr::store::Store, argv: [string]) -> int is
+    if array_len(argv) != 2 is return ui::fail("usage: hco import ROOTFS.tar NAME") end
+    let id: string = ctr::image_import(s, argv[0], argv[1])
+    if id == "" is return ui::fail("cannot import " + argv[0]) end
+    ui::success("imported " + colors::bold(argv[1]) + " " + colors::theme::muted("(" + utils::short_id(id) + ")"))
+    return 0
+end
+
+;; hco push SOURCE DESTINATION
+pub fn cmd_push(s: ctr::store::Store, argv: [string]) -> int is
+    if array_len(argv) != 2 is return ui::fail("usage: hco push SOURCE DESTINATION") end
+    ui::step(1, 1, "pushing " + argv[0] + " → " + colors::bold(argv[1]))
+    if ctr::image_push(s, argv[0], argv[1]) is
+        ui::success("pushed " + argv[1])
+        return 0
+    end
+    return ui::fail_hint("push failed", "log in first: hco login REGISTRY -u USER")
+end
+
+;; hco login REGISTRY -u USER [--password-stdin]
+pub fn cmd_login(s: ctr::store::Store, argv: [string]) -> int is
+    let p = args::parse(argv, ["-u", "--username", "-p", "--password"], false)
+    let host: string = args::pos_at(p, 0)
+    if host == "" is return ui::fail("usage: hco login REGISTRY -u USER [--password-stdin]") end
+    let mut user: string = args::get(p, ["-u", "--username"])
+    if user == "" is
+        ui::out(colors::theme::info("username: "))
+        user = string_trim(env_read_line())
+    end
+    let mut pass: string = args::get(p, ["-p", "--password"])
+    if pass == "" is
+        ui::out(colors::theme::info("password: "))
+        utils::quiet("stty -echo 2>/dev/null")
+        pass = string_trim(env_read_line())
+        utils::quiet("stty echo 2>/dev/null")
+    end
+    if ctr::registry_login(s, host, user, pass) is
+        ui::success("logged in to " + colors::bold(host) + " as " + user)
+        return 0
+    end
+    return ui::fail("login to " + host + " failed")
+end
+
+pub fn cmd_logout(s: ctr::store::Store, argv: [string]) -> int is
+    if array_len(argv) != 1 is return ui::fail("usage: hco logout REGISTRY") end
+    if ctr::registry_logout(s, argv[0]) is
+        ui::success("logged out of " + argv[0])
+        return 0
+    end
+    return ui::fail("not logged in to " + argv[0])
+end
+
+;; hco image prune — drops unreferenced blobs and layers.
+pub fn cmd_prune(s: ctr::store::Store) -> int is
+    let before: int = utils::dir_size(s.st_root + "/blobs") + utils::dir_size(s.st_root + "/layers")
+    ctr::image_gc(s)
+    let after: int = utils::dir_size(s.st_root + "/blobs") + utils::dir_size(s.st_root + "/layers")
+    ui::success("reclaimed " + colors::bold(utils::human_bytes(utils::max_int(before - after, 0))))
+    return 0
 end
